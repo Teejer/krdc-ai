@@ -537,6 +537,14 @@ bool RemoteView::event(QEvent *event)
     case QEvent::MouseButtonPress:
     case QEvent::MouseButtonRelease:
     case QEvent::MouseMove:
+        if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonDblClick) {
+            // Clicking the remote view must send the following keys there and
+            // not to whatever widget was focused before (a side panel, for
+            // instance); without this the first click only moves focus.
+            if (!hasFocus()) {
+                setFocus();
+            }
+        }
         handleMouseEvent(static_cast<QMouseEvent *>(event));
         return true;
         break;
