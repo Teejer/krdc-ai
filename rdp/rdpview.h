@@ -60,6 +60,13 @@ public:
 
     QPixmap takeScreenshot() override;
 
+    bool supportsAiControl() const override;
+    void aiMouseMove(const QPoint &pos) override;
+    void aiMouseButton(const QPoint &pos, Qt::MouseButton button, bool pressed) override;
+    void aiMouseWheel(const QPoint &pos, const QPoint &angleDelta) override;
+    void aiKeyPress(int key, Qt::KeyboardModifiers modifiers, bool pressed) override;
+    bool aiTypeText(const QString &text) override;
+
     void savePassword(const QString &password);
 
 public Q_SLOTS:

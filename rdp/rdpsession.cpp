@@ -4,6 +4,7 @@
  */
 
 #include "rdpsession.h"
+#include "rdpaiinput.h"
 #include "rdpcliprdr.h"
 #include "rdpdisp.h"
 #include "rdpgraphics.h"
@@ -1583,6 +1584,203 @@ void RdpSession::setState(RdpSession::State newState)
 
     m_state = newState;
     Q_EMIT stateChanged();
+}
+
+bool RdpSession::aiInputReady() const
+{
+    return m_state == State::Running && m_context.rdp && m_context.rdp->input;
+}
+
+static QPoint clampToSession(const QSize &size, const QPoint &pos)
+{
+    if (size.isEmpty()) {
+        return pos;
+    }
+    return QPoint{std::clamp(pos.x(), 0, size.width() - 1), std::clamp(pos.y(), 0, size.height() - 1)};
+}
+
+bool RdpSession::aiSendPointerMove(const QPoint &pos)
+{
+    if (!aiInputReady()) {
+        return false;
+    }
+
+    const QPoint remote = clampToSession(m_size, pos);
+    return freerdp_input_send_mouse_event(m_context.rdp->input, PTR_FLAGS_MOVE, uint16_t(remote.x()), uint16_t(remote.y()));
+}
+
+bool RdpSession::aiSendPointerButton(const QPoint &pos, Qt::MouseButton button, bool pressed)
+{
+    if (!aiInputReady()) {
+        return false;
+    }
+
+    bool extended = false;
+    UINT16 flags = 0;
+
+    switch (button) {
+    case Qt::LeftButton:
+        flags |= PTR_FLAGS_BUTTON1;
+        break;
+    case Qt::RightButton:
+        flags |= PTR_FLAGS_BUTTON2;
+        break;
+    case Qt::MiddleButton:
+        flags |= PTR_FLAGS_BUTTON3;
+        break;
+    case Qt::BackButton:
+        flags |= PTR_XFLAGS_BUTTON1;
+        extended = true;
+        break;
+    case Qt::ForwardButton:
+        flags |= PTR_XFLAGS_BUTTON2;
+        extended = true;
+        break;
+    default:
+        return false;
+    }
+
+    if (pressed) {
+        flags |= extended ? PTR_XFLAGS_DOWN : PTR_FLAGS_DOWN;
+    }
+
+    const QPoint remote = clampToSession(m_size, pos);
+
+    if (extended) {
+        return freerdp_input_send_extended_mouse_event(m_context.rdp->input, flags, uint16_t(remote.x()), uint16_t(remote.y()));
+    }
+    return freerdp_input_send_mouse_event(m_context.rdp->input, flags, uint16_t(remote.x()), uint16_t(remote.y()));
+}
+
+bool RdpSession::aiSendPointerWheel(const QPoint &pos, const QPoint &angleDelta)
+{
+    if (!aiInputReady()) {
+        return false;
+    }
+
+    uint16_t flags = 0;
+    uint16_t value = 0;
+
+    if (angleDelta.y() != 0) {
+        value = std::clamp(std::abs(angleDelta.y()), 0, 0xFF);
+        flags |= PTR_FLAGS_WHEEL;
+        if (angleDelta.y() < 0) {
+            flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+            flags = (flags & 0xFF00) | (0x100 - value);
+        } else {
+            flags |= value;
+        }
+    } else if (angleDelta.x() != 0) {
+        value = std::clamp(std::abs(angleDelta.x()), 0, 0xFF);
+        flags |= PTR_FLAGS_HWHEEL;
+        if (angleDelta.x() < 0) {
+            flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+            flags = (flags & 0xFF00) | (0x100 - value);
+        } else {
+            flags |= value;
+        }
+    } else {
+        return false;
+    }
+
+    const QPoint remote = clampToSession(m_size, pos);
+    return freerdp_input_send_mouse_event(m_context.rdp->input, flags, uint16_t(remote.x()), uint16_t(remote.y()));
+}
+
+bool RdpSession::aiSendVirtualKey(DWORD virtualKey, bool pressed)
+{
+    if (!aiInputReady() || virtualKey == 0) {
+        return false;
+    }
+
+    const auto keyboardType = freerdp_settings_get_uint32(m_context.rdp->settings, FreeRDP_KeyboardType);
+    const DWORD code = GetVirtualScanCodeFromVirtualKeyCode(virtualKey, keyboardType);
+    if (code == 0) {
+        qCWarning(KRDC) << "No scancode for virtual key" << virtualKey;
+        return false;
+    }
+
+    return freerdp_input_send_keyboard_event_ex(m_context.rdp->input, pressed ? TRUE : FALSE, FALSE, code);
+}
+
+bool RdpSession::aiSendUnicodeChar(QChar ch)
+{
+    if (!aiInputReady() || !ch.unicode()) {
+        return false;
+    }
+
+    if (!freerdp_input_send_unicode_keyboard_event(m_context.rdp->input, 0, ch.unicode())) {
+        return false;
+    }
+    return freerdp_input_send_unicode_keyboard_event(m_context.rdp->input, KBD_FLAGS_RELEASE, ch.unicode());
+}
+
+int RdpSession::aiTypeText(const QString &text)
+{
+    if (!aiInputReady()) {
+        return text.length();
+    }
+
+    int unsupported = 0;
+
+    for (const QChar &ch : text) {
+        Qt::KeyboardModifiers modifiers = Qt::NoModifier;
+        const DWORD vk = RdpAiInput::virtualKeyForChar(ch, modifiers);
+
+        if (vk != 0) {
+            const bool shift = modifiers.testFlag(Qt::ShiftModifier);
+            if (shift) {
+                aiSendVirtualKey(VK_SHIFT, true);
+            }
+            const bool sent = aiSendVirtualKey(vk, true);
+            aiSendVirtualKey(vk, false);
+            if (shift) {
+                aiSendVirtualKey(VK_SHIFT, false);
+            }
+            if (sent) {
+                continue;
+            }
+        }
+
+        // Accented and non-Latin characters have no entry in the scancode
+        // table; the Unicode input virtual channel is the only way in.
+        if (!aiSendUnicodeChar(ch)) {
+            ++unsupported;
+        }
+    }
+
+    return unsupported;
+}
+
+bool RdpSession::aiPressQtKey(int key, Qt::KeyboardModifiers modifiers, bool pressed)
+{
+    if (!aiInputReady()) {
+        return false;
+    }
+
+    const DWORD vk = RdpAiInput::virtualKeyForQtKey(key);
+    if (vk == 0) {
+        return false;
+    }
+
+    const QVector<DWORD> held = RdpAiInput::modifierVirtualKeys(modifiers);
+
+    if (pressed) {
+        for (const DWORD modifier : held) {
+            if (modifier != vk) {
+                aiSendVirtualKey(modifier, true);
+            }
+        }
+        return aiSendVirtualKey(vk, true);
+    }
+
+    const bool sent = aiSendVirtualKey(vk, false);
+    for (auto it = held.crbegin(); it != held.crend(); ++it) {
+        if (*it != vk) {
+            aiSendVirtualKey(*it, false);
+        }
+    }
+    return sent;
 }
 
 bool RdpSession::onAuthenticate(char **username, char **password, char **domain)

@@ -403,6 +403,52 @@ QPixmap RdpView::takeScreenshot()
     return QPixmap{};
 }
 
+bool RdpView::supportsAiControl() const
+{
+    return m_session && m_session->aiInputReady();
+}
+
+void RdpView::aiMouseMove(const QPoint &pos)
+{
+    if (m_session) {
+        m_session->aiSendPointerMove(pos);
+    }
+}
+
+void RdpView::aiMouseButton(const QPoint &pos, Qt::MouseButton button, bool pressed)
+{
+    if (!m_session) {
+        return;
+    }
+
+    // Move first so the remote pointer is where the button is pressed; a
+    // button event alone does not always update the hover state.
+    m_session->aiSendPointerMove(pos);
+    m_session->aiSendPointerButton(pos, button, pressed);
+}
+
+void RdpView::aiMouseWheel(const QPoint &pos, const QPoint &angleDelta)
+{
+    if (m_session) {
+        m_session->aiSendPointerWheel(pos, angleDelta);
+    }
+}
+
+void RdpView::aiKeyPress(int key, Qt::KeyboardModifiers modifiers, bool pressed)
+{
+    if (m_session) {
+        m_session->aiPressQtKey(key, modifiers, pressed);
+    }
+}
+
+bool RdpView::aiTypeText(const QString &text)
+{
+    if (!m_session) {
+        return false;
+    }
+    return m_session->aiTypeText(text) == 0;
+}
+
 bool RdpView::supportsScaling() const
 {
     return true;

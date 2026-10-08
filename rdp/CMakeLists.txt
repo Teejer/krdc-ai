@@ -1,6 +1,7 @@
 add_library(krdc_rdpplugin MODULE)
 
 target_sources(krdc_rdpplugin PRIVATE
+    rdpaiinput.cpp
     rdpcliprdr.cpp
     rdpdisp.cpp
     rdpgraphics.cpp

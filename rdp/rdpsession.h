@@ -117,6 +117,44 @@ public:
     bool sendEvent(QEvent *event, QWidget *source, const QRect &remoteRect);
     bool syncKeyState();
 
+    // ------------------------------------------------------------------
+    // Input injected by the AI assistant. Unlike sendEvent() these take
+    // remote framebuffer coordinates directly, because that is the space the
+    // screenshots the assistant sees are in.
+    // ------------------------------------------------------------------
+
+    /**
+     * @return true if the session is up and can accept injected input.
+     */
+    bool aiInputReady() const;
+
+    bool aiSendPointerMove(const QPoint &pos);
+    bool aiSendPointerButton(const QPoint &pos, Qt::MouseButton button, bool pressed);
+    bool aiSendPointerWheel(const QPoint &pos, const QPoint &angleDelta);
+    /**
+     * Presses or releases a Windows virtual key code, converting it to the
+     * scancode set negotiated with the server.
+     */
+    bool aiSendVirtualKey(DWORD virtualKey, bool pressed);
+    /**
+     * Types a single character through the Unicode keyboard event path, which
+     * works for characters the negotiated scancode set cannot express.
+     */
+    bool aiSendUnicodeChar(QChar ch);
+
+    /**
+     * Types @p text, holding Shift where the layout requires it. Characters
+     * that neither the scancode table nor the Unicode path can express are
+     * skipped.
+     * @return the number of characters that could not be injected.
+     */
+    int aiTypeText(const QString &text);
+
+    /**
+     * Presses or releases the Qt key @p key with @p modifiers held down.
+     */
+    bool aiPressQtKey(int key, Qt::KeyboardModifiers modifiers, bool pressed);
+
     void initializeClipboard(RdpContext *krdp, CliprdrClientContext *cliprdr);
     void initializeDisplay(RdpContext *krdp, DispClientContext *disp);
     void destroyClipboard();
