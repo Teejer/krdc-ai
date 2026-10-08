@@ -1,0 +1,851 @@
+/*
+    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
+
+    SPDX-License-Identifier: GPL-2.0-or-later
+*/
+
+#include "aiconversation.h"
+
+#include "aikeys.h"
+#include "krdc_debug.h"
+
+#include "../core/remoteview.h"
+
+#include <QBuffer>
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonParseError>
+#include <QJsonObject>
+#include <QStandardPaths>
+#include <QTimer>
+
+#include <KLocalizedString>
+
+namespace
+{
+// Safety limits so a confused model cannot spin forever or stall the UI.
+constexpr int MaxToolRounds = 25;
+constexpr int MaxHistoryEntries = 200;
+constexpr int TypeChunkSize = 64;
+constexpr int MaxTypeDelayMs = 200;
+constexpr double MaxWaitSeconds = 30.0;
+
+// How many trailing entries survive into the saved history.
+constexpr int SavedHistoryEntries = 120;
+
+int clampInt(double value, int minimum, int maximum, int fallback)
+{
+    if (value <= 0) {
+        return fallback;
+    }
+    return std::clamp(int(value), minimum, maximum);
+}
+
+Qt::MouseButton buttonFromName(const QString &name, bool *ok = nullptr)
+{
+    if (ok) {
+        *ok = true;
+    }
+    if (name.isEmpty() || name == QLatin1String("left")) {
+        return Qt::LeftButton;
+    }
+    if (name == QLatin1String("right")) {
+        return Qt::RightButton;
+    }
+    if (name == QLatin1String("middle")) {
+        return Qt::MiddleButton;
+    }
+    if (ok) {
+        *ok = false;
+    }
+    return Qt::LeftButton;
+}
+}
+
+AiConversation::AiConversation(const QString &key, QObject *parent)
+    : QObject(parent)
+    , m_key(key)
+    , m_config(AiConfig::load())
+{
+    m_client.setConfig(m_config);
+    connect(&m_client, &AiHttpClient::replyReceived, this, &AiConversation::onReply);
+    connect(&m_client, &AiHttpClient::requestFailed, this, &AiConversation::onFailed);
+
+    if (m_config.rememberHistory) {
+        load();
+    }
+}
+
+QString AiConversation::key() const
+{
+    return m_key;
+}
+
+QString AiConversation::title() const
+{
+    return m_title;
+}
+
+void AiConversation::setTitle(const QString &title)
+{
+    m_title = title;
+}
+
+RemoteView *AiConversation::view() const
+{
+    return m_view;
+}
+
+void AiConversation::setView(RemoteView *view)
+{
+    m_view = view;
+}
+
+bool AiConversation::busy() const
+{
+    return m_busy;
+}
+
+const QList<AiConversation::Entry> &AiConversation::entries() const
+{
+    return m_entries;
+}
+
+bool AiConversation::awaitingApproval() const
+{
+    return m_awaiting;
+}
+
+QString AiConversation::pendingSummary() const
+{
+    if (m_queueIndex < m_queue.size()) {
+        const PendingTool &pending = m_queue.at(m_queueIndex);
+        return AiTools::describe(pending.call.name, pending.call.arguments);
+    }
+    return {};
+}
+
+QString AiConversation::pendingReason() const
+{
+    if (m_queueIndex < m_queue.size()) {
+        const PendingTool &pending = m_queue.at(m_queueIndex);
+        return AiTools::dangerReason(pending.call.name, pending.call.arguments);
+    }
+    return {};
+}
+
+void AiConversation::setConfig(const AiConfig &config)
+{
+    m_config = config;
+    m_client.setConfig(config);
+}
+
+const AiConfig &AiConversation::config() const
+{
+    return m_config;
+}
+
+void AiConversation::setAttachScreenshotDefault(bool attach)
+{
+    if (m_config.attachScreenshot == attach) {
+        return;
+    }
+    m_config.attachScreenshot = attach;
+    m_config.save();
+}
+
+void AiConversation::ask(const QString &question, bool attachScreenshot)
+{
+    if (m_busy) {
+        return;
+    }
+
+    Entry entry;
+    entry.role = Role::User;
+    entry.text = question;
+    if (attachScreenshot) {
+        entry.image = grabScreenshot();
+    }
+    m_entries.append(entry);
+
+    m_rounds = 0;
+    setBusy(true);
+    Q_EMIT entriesChanged();
+    sendToModel();
+}
+
+void AiConversation::approve()
+{
+    if (!m_awaiting) {
+        return;
+    }
+    m_awaiting = false;
+
+    const PendingTool pending = m_queue.at(m_queueIndex);
+    Q_EMIT entriesChanged();
+
+    runTool(pending);
+
+    // Same continuation rule as processQueue(): if the tool handed work to an
+    // async step, its slot advances the queue when it reports back.
+    if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive) {
+        return;
+    }
+    m_queueIndex++;
+    processQueue();
+}
+
+void AiConversation::deny()
+{
+    if (!m_awaiting) {
+        return;
+    }
+    m_awaiting = false;
+    m_denied = true;
+
+    // processQueue() sees m_denied and reports the rejection to the model as
+    // this call's tool result, then continues with the remaining calls.
+    Q_EMIT entriesChanged();
+    processQueue();
+}
+
+void AiConversation::cancel()
+{
+    if (!m_busy) {
+        return;
+    }
+
+    m_awaiting = false;
+    m_denied = false;
+    m_queue.clear();
+    m_queueIndex = 0;
+    m_typeRemainder.clear();
+    m_waitActive = false;
+    m_client.cancel();
+
+    Entry note;
+    note.role = Role::Note;
+    note.text = i18n("Stopped.");
+    m_entries.append(note);
+
+    setBusy(false);
+    Q_EMIT entriesChanged();
+    save();
+}
+
+void AiConversation::clear()
+{
+    if (m_busy) {
+        cancel();
+    }
+    m_entries.clear();
+    save();
+    Q_EMIT entriesChanged();
+}
+
+QByteArray AiConversation::grabScreenshot() const
+{
+    if (!m_view || m_view->status() != RemoteView::Connected) {
+        return {};
+    }
+
+    QPixmap pixmap = m_view->takeScreenshot();
+    if (pixmap.isNull()) {
+        return {};
+    }
+
+    const int maxSize = qMax(320, m_config.imageMaxSize);
+    if (pixmap.width() > maxSize || pixmap.height() > maxSize) {
+        pixmap = pixmap.scaled(QSize{maxSize, maxSize}, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+
+    QByteArray bytes;
+    QBuffer buffer{&bytes};
+    buffer.open(QIODevice::WriteOnly);
+    if (!pixmap.save(&buffer, "JPEG", std::clamp(m_config.imageQuality, 10, 100))) {
+        return {};
+    }
+    return bytes;
+}
+
+QSize AiConversation::screenSize() const
+{
+    if (!m_view) {
+        return {};
+    }
+    const QSize size = m_view->framebufferSize();
+    return size.isValid() && !size.isEmpty() ? size : m_view->size();
+}
+
+void AiConversation::sendToModel()
+{
+    m_client.request(buildMessages(), AiTools::schemas());
+}
+
+QJsonArray AiConversation::buildMessages() const
+{
+    QJsonArray messages;
+
+    QString system = m_config.systemPrompt.trimmed();
+    if (system.isEmpty()) {
+        system = AiConfig::defaultSystemPrompt();
+    }
+
+    QJsonObject systemMessage;
+    systemMessage.insert(QStringLiteral("role"), QStringLiteral("system"));
+    systemMessage.insert(QStringLiteral("content"), system);
+    messages.append(systemMessage);
+
+    for (const Entry &entry : m_entries) {
+        switch (entry.role) {
+        case Role::User: {
+            QJsonObject message;
+            message.insert(QStringLiteral("role"), QStringLiteral("user"));
+            if (entry.image.isEmpty()) {
+                message.insert(QStringLiteral("content"), entry.text);
+            } else {
+                QJsonArray parts;
+
+                QJsonObject text;
+                text.insert(QStringLiteral("type"), QStringLiteral("text"));
+                text.insert(QStringLiteral("text"), entry.text);
+                parts.append(text);
+
+                QJsonObject image;
+                image.insert(QStringLiteral("type"), QStringLiteral("image_url"));
+                QJsonObject imageUrl;
+                imageUrl.insert(QStringLiteral("url"), QStringLiteral("data:image/jpeg;base64,%1").arg(QString::fromLatin1(entry.image.toBase64())));
+                image.insert(QStringLiteral("image_url"), imageUrl);
+                parts.append(image);
+
+                message.insert(QStringLiteral("content"), parts);
+            }
+            messages.append(message);
+            break;
+        }
+        case Role::Assistant: {
+            QJsonObject message;
+            message.insert(QStringLiteral("role"), QStringLiteral("assistant"));
+            message.insert(QStringLiteral("content"), entry.text.isEmpty() ? QString() : entry.text);
+
+            if (!entry.toolCalls.isEmpty()) {
+                QJsonArray calls;
+                for (const AiToolCall &call : entry.toolCalls) {
+                    QJsonObject object;
+                    object.insert(QStringLiteral("id"), call.id);
+                    object.insert(QStringLiteral("type"), QStringLiteral("function"));
+                    QJsonObject function;
+                    function.insert(QStringLiteral("name"), call.name);
+                    function.insert(QStringLiteral("arguments"), QString::fromUtf8(QJsonDocument(call.arguments).toJson(QJsonDocument::Compact)));
+                    object.insert(QStringLiteral("function"), function);
+                    calls.append(object);
+                }
+                message.insert(QStringLiteral("tool_calls"), calls);
+            }
+            messages.append(message);
+            break;
+        }
+        case Role::Tool: {
+            QJsonObject message;
+            message.insert(QStringLiteral("role"), QStringLiteral("tool"));
+            message.insert(QStringLiteral("tool_call_id"), entry.toolCallId);
+            if (entry.image.isEmpty()) {
+                message.insert(QStringLiteral("content"), entry.text);
+            } else {
+                // A screenshot result: text plus image, which several OpenAI
+                // compatible servers accept in a tool message.
+                QJsonArray parts;
+
+                QJsonObject text;
+                text.insert(QStringLiteral("type"), QStringLiteral("text"));
+                text.insert(QStringLiteral("text"), entry.text);
+                parts.append(text);
+
+                QJsonObject image;
+                image.insert(QStringLiteral("type"), QStringLiteral("image_url"));
+                QJsonObject imageUrl;
+                imageUrl.insert(QStringLiteral("url"), QStringLiteral("data:image/jpeg;base64,%1").arg(QString::fromLatin1(entry.image.toBase64())));
+                image.insert(QStringLiteral("image_url"), imageUrl);
+                parts.append(image);
+
+                message.insert(QStringLiteral("content"), parts);
+            }
+            messages.append(message);
+            break;
+        }
+        case Role::Note:
+            // Display-only, never sent to the model.
+            break;
+        }
+    }
+
+    return messages;
+}
+
+void AiConversation::onReply(const QString &content, const QList<AiToolCall> &toolCalls)
+{
+    Entry entry;
+    entry.role = Role::Assistant;
+    entry.text = content;
+    entry.toolCalls = toolCalls;
+    m_entries.append(entry);
+    Q_EMIT entriesChanged();
+
+    if (toolCalls.isEmpty()) {
+        setBusy(false);
+        save();
+        return;
+    }
+
+    if (++m_rounds > MaxToolRounds) {
+        Entry note;
+        note.role = Role::Note;
+        note.text = i18n("Too many tool calls in a row; stopping to avoid a loop. Ask me again if you want me to continue.");
+        m_entries.append(note);
+        setBusy(false);
+        Q_EMIT entriesChanged();
+        save();
+        return;
+    }
+
+    m_queue.clear();
+    m_queueIndex = 0;
+    for (const AiToolCall &call : toolCalls) {
+        PendingTool pending;
+        pending.call = call;
+        pending.risk = AiTools::risk(call.name, call.arguments);
+        m_queue.append(pending);
+    }
+
+    processQueue();
+}
+
+void AiConversation::onFailed(const QString &message)
+{
+    Entry note;
+    note.role = Role::Note;
+    note.text = i18n("The assistant could not answer.");
+    note.detail = message;
+    m_entries.append(note);
+
+    setBusy(false);
+    Q_EMIT entriesChanged();
+    save();
+}
+
+void AiConversation::processQueue()
+{
+    while (m_queueIndex < m_queue.size()) {
+        const PendingTool pending = m_queue.at(m_queueIndex);
+
+        if (!pending.call.error.isEmpty()) {
+            failTool(pending.call, pending.call.error);
+            m_queueIndex++;
+            continue;
+        }
+
+        if (m_denied) {
+            m_denied = false;
+            failTool(pending.call, QStringLiteral("The user rejected this action. Do not retry it without being asked to."));
+            m_queueIndex++;
+            continue;
+        }
+
+        const bool autoRun = pending.risk == AiTools::Risk::Safe || (m_config.autoExecute && pending.risk == AiTools::Risk::Action);
+        if (!autoRun) {
+            m_awaiting = true;
+            Q_EMIT entriesChanged();
+            Q_EMIT approvalRequested();
+            return;
+        }
+
+        runTool(pending);
+
+        // runTool is synchronous unless it handed work to the model, started
+        // paced typing or a wait timer. In those cases the continuation
+        // happens in a slot; stop here so we do not run later calls out of
+        // order.
+        if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive) {
+            return;
+        }
+        m_queueIndex++;
+    }
+
+    if (!m_queue.isEmpty() && !m_typeRemainder.isEmpty()) {
+        return; // paced typing still running, its slot continues from here
+    }
+
+    if (m_client.busy() || m_waitActive) {
+        return;
+    }
+
+    m_queue.clear();
+    m_queueIndex = 0;
+
+    // If the round we just finished was a tool round, the model needs the
+    // results before it can continue the turn.
+    const bool wasToolRound = !m_entries.isEmpty() && m_entries.last().role == Role::Tool;
+    if (wasToolRound && m_rounds < MaxToolRounds) {
+        Q_EMIT entriesChanged();
+        sendToModel();
+        return;
+    }
+
+    setBusy(false);
+    Q_EMIT entriesChanged();
+    save();
+}
+
+void AiConversation::finishTool(const AiToolCall &call, const QString &result, const QByteArray &image)
+{
+    Entry entry;
+    entry.role = Role::Tool;
+    entry.text = result;
+    entry.toolCallId = call.id;
+    entry.toolName = call.name;
+    entry.image = image;
+    m_entries.append(entry);
+    Q_EMIT entriesChanged();
+}
+
+void AiConversation::failTool(const AiToolCall &call, const QString &message)
+{
+    finishTool(call, QStringLiteral("error: %1").arg(message));
+}
+
+void AiConversation::setBusy(bool busy)
+{
+    if (m_busy == busy) {
+        return;
+    }
+    m_busy = busy;
+    Q_EMIT busyChanged();
+}
+
+void AiConversation::runTool(const PendingTool &pending)
+{
+    const AiToolCall &call = pending.call;
+    const QString name = call.name;
+    const QJsonObject &args = call.arguments;
+
+    RemoteView *view = m_view;
+
+    if (name == QLatin1String("take_screenshot")) {
+        const QByteArray image = grabScreenshot();
+        if (image.isEmpty()) {
+            failTool(call, QStringLiteral("No screenshot available. Is the connection established?"));
+        } else {
+            finishTool(call, QStringLiteral("Screenshot attached. Remote screen is %1x%2 pixels.").arg(screenSize().width()).arg(screenSize().height()),
+                       image);
+        }
+        return;
+    }
+
+    if (name == QLatin1String("screen_info")) {
+        const QSize size = screenSize();
+        QJsonObject result;
+        result.insert(QStringLiteral("host"), view ? view->host() : QString());
+        result.insert(QStringLiteral("url"), view ? view->url().toString() : QString());
+        result.insert(QStringLiteral("screen_width"), size.width());
+        result.insert(QStringLiteral("screen_height"), size.height());
+        result.insert(QStringLiteral("connected"), view && view->status() == RemoteView::Connected);
+        result.insert(QStringLiteral("input_ready"), view && view->supportsAiControl());
+        finishTool(call, QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
+        return;
+    }
+
+    if (!view || view->status() != RemoteView::Connected) {
+        failTool(call, QStringLiteral("Not connected to the remote machine right now."));
+        return;
+    }
+
+    if (name == QLatin1String("mouse_move")) {
+        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
+        view->aiMouseMove(pos);
+        finishTool(call, QStringLiteral("Pointer moved to (%1, %2).").arg(pos.x()).arg(pos.y()));
+        return;
+    }
+
+    if (name == QLatin1String("mouse_click")) {
+        bool buttonOk = true;
+        const Qt::MouseButton button = buttonFromName(args.value(QStringLiteral("button")).toString(), &buttonOk);
+        if (!buttonOk) {
+            failTool(call, QStringLiteral("Unknown mouse button “%1”.").arg(args.value(QStringLiteral("button")).toString()));
+            return;
+        }
+
+        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
+        const int clicks = clampInt(args.value(QStringLiteral("clicks")).toDouble(1), 1, 3, 1);
+
+        view->aiMouseMove(pos);
+        for (int i = 0; i < clicks; ++i) {
+            view->aiMouseButton(pos, button, true);
+            view->aiMouseButton(pos, button, false);
+        }
+        finishTool(call, QStringLiteral("Clicked %1× at (%2, %3).").arg(clicks).arg(pos.x()).arg(pos.y()));
+        return;
+    }
+
+    if (name == QLatin1String("mouse_drag")) {
+        bool buttonOk = true;
+        const Qt::MouseButton button = buttonFromName(args.value(QStringLiteral("button")).toString(), &buttonOk);
+        if (!buttonOk) {
+            failTool(call, QStringLiteral("Unknown mouse button “%1”.").arg(args.value(QStringLiteral("button")).toString()));
+            return;
+        }
+
+        const QPoint from{int(args.value(QStringLiteral("from_x")).toDouble()), int(args.value(QStringLiteral("from_y")).toDouble())};
+        const QPoint to{int(args.value(QStringLiteral("to_x")).toDouble()), int(args.value(QStringLiteral("to_y")).toDouble())};
+
+        // Intermediate moves so the remote drags (text selection, window
+        // moves) track the pointer instead of teleporting.
+        view->aiMouseMove(from);
+        view->aiMouseButton(from, button, true);
+        constexpr int Steps = 8;
+        for (int i = 1; i <= Steps; ++i) {
+            const qreal t = qreal(i) / Steps;
+            view->aiMouseMove(QPoint{from.x() + int((to.x() - from.x()) * t), from.y() + int((to.y() - from.y()) * t)});
+        }
+        view->aiMouseButton(to, button, false);
+        finishTool(call, QStringLiteral("Dragged from (%1, %2) to (%3, %4).").arg(from.x()).arg(from.y()).arg(to.x()).arg(to.y()));
+        return;
+    }
+
+    if (name == QLatin1String("mouse_scroll")) {
+        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
+        const QString direction = args.value(QStringLiteral("direction")).toString().toLower();
+        const int notches = clampInt(args.value(QStringLiteral("notches")).toDouble(1), 1, 20, 1);
+
+        QPoint delta;
+        if (direction == QLatin1String("up")) {
+            delta = QPoint{0, 120 * notches};
+        } else if (direction == QLatin1String("down")) {
+            delta = QPoint{0, -120 * notches};
+        } else if (direction == QLatin1String("left")) {
+            delta = QPoint{-120 * notches, 0};
+        } else if (direction == QLatin1String("right")) {
+            delta = QPoint{120 * notches, 0};
+        } else {
+            failTool(call, QStringLiteral("Unknown scroll direction “%1”. Use up, down, left or right.").arg(direction));
+            return;
+        }
+
+        view->aiMouseWheel(pos, delta);
+        finishTool(call, QStringLiteral("Scrolled %1×%2 at (%3, %4).").arg(notches).arg(direction, pos.x()).arg(pos.y()));
+        return;
+    }
+
+    if (name == QLatin1String("type_text")) {
+        const QString text = args.value(QStringLiteral("text")).toString();
+        if (text.isEmpty()) {
+            failTool(call, QStringLiteral("No text was given."));
+            return;
+        }
+
+        const int delay = clampInt(args.value(QStringLiteral("delay_ms")).toDouble(0), 0, MaxTypeDelayMs, 0);
+        if (delay == 0) {
+            if (view->aiTypeText(text)) {
+                finishTool(call, QStringLiteral("Typed %1 characters.").arg(text.length()));
+            } else {
+                finishTool(call, QStringLiteral("Typed %1 characters, but some characters could not be injected.").arg(text.length()));
+            }
+            return;
+        }
+
+        // Paced typing: send in chunks on a timer so the remote field keeps up.
+        m_typeCall = call;
+        m_typeDelay = delay;
+        m_typeRemainder = text;
+        QMetaObject::invokeMethod(this, &AiConversation::typeNextChunk, Qt::QueuedConnection);
+        return;
+    }
+
+    if (name == QLatin1String("press_key")) {
+        const QStringList modifierNames = [&args] {
+            QStringList names;
+            for (const QJsonValue &value : args.value(QStringLiteral("modifiers")).toArray()) {
+                names.append(value.toString());
+            }
+            return names;
+        }();
+
+        QStringList unknownModifiers;
+        const Qt::KeyboardModifiers modifiers = AiKeys::modifiers(modifierNames, unknownModifiers);
+        if (!unknownModifiers.isEmpty()) {
+            failTool(call, QStringLiteral("Unknown modifier key(s): %1.").arg(unknownModifiers.join(QStringLiteral(", "))));
+            return;
+        }
+
+        const int key = AiKeys::qtKey(args.value(QStringLiteral("key")).toString());
+        if (key == 0) {
+            failTool(call, QStringLiteral("Unknown key “%1”.").arg(args.value(QStringLiteral("key")).toString()));
+            return;
+        }
+
+        view->aiKeyPress(key, modifiers, true);
+        view->aiKeyPress(key, modifiers, false);
+        finishTool(call, QStringLiteral("Key pressed."));
+        return;
+    }
+
+    if (name == QLatin1String("wait")) {
+        const double seconds = std::clamp(args.value(QStringLiteral("seconds")).toDouble(1.0), 0.1, MaxWaitSeconds);
+        m_waitCall = call;
+        m_waitActive = true;
+        QTimer::singleShot(int(seconds * 1000.0), this, [this] {
+            m_waitActive = false;
+            if (!m_busy) {
+                return; // the turn was cancelled while we waited
+            }
+            finishTool(m_waitCall, QStringLiteral("Waited, you can look at the screen again."));
+            m_queueIndex++;
+            processQueue();
+        });
+        return;
+    }
+
+    failTool(call, QStringLiteral("Unknown tool “%1”.").arg(name));
+}
+
+void AiConversation::typeNextChunk()
+{
+    RemoteView *view = m_view;
+    if (!view || !m_busy) {
+        m_typeRemainder.clear();
+        return;
+    }
+
+    const QString chunk = m_typeRemainder.left(TypeChunkSize);
+    m_typeRemainder.remove(0, chunk.length());
+
+    const bool ok = view->aiTypeText(chunk);
+    if (!ok) {
+        m_typeRemainder.clear();
+        failTool(m_typeCall, QStringLiteral("Typing failed partway through; the connection may not accept text input."));
+        m_queueIndex++;
+        processQueue();
+        return;
+    }
+
+    if (m_typeRemainder.isEmpty()) {
+        finishTool(m_typeCall, QStringLiteral("Typed text."));
+        m_queueIndex++;
+        processQueue();
+    } else {
+        QTimer::singleShot(m_typeDelay, this, &AiConversation::typeNextChunk);
+    }
+}
+
+QString AiConversation::historyFilePath() const
+{
+    const QString directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/ai");
+    const QByteArray digest = QCryptographicHash::hash(m_key.toUtf8(), QCryptographicHash::Sha1).toHex();
+    return directory + QStringLiteral("/%1.json").arg(QString::fromLatin1(digest));
+}
+
+void AiConversation::load()
+{
+    QFile file{historyFilePath()};
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (!document.isObject()) {
+        qCWarning(KRDC) << "Could not read AI history" << file.fileName() << parseError.errorString();
+        return;
+    }
+
+    const QJsonObject root = document.object();
+    m_title = root.value(QStringLiteral("title")).toString();
+
+    const QJsonArray entries = root.value(QStringLiteral("entries")).toArray();
+    for (const QJsonValue &value : entries) {
+        const QJsonObject object = value.toObject();
+        Entry entry;
+        const QString role = object.value(QStringLiteral("role")).toString();
+        if (role == QLatin1String("user")) {
+            entry.role = Role::User;
+        } else if (role == QLatin1String("assistant")) {
+            entry.role = Role::Assistant;
+        } else if (role == QLatin1String("tool")) {
+            entry.role = Role::Tool;
+        } else {
+            continue;
+        }
+        entry.text = object.value(QStringLiteral("text")).toString();
+        const QString savedTime = object.value(QStringLiteral("time")).toString();
+        if (!savedTime.isEmpty()) {
+            entry.timestamp = QDateTime::fromString(savedTime, Qt::ISODateWithMs);
+        }
+        entry.toolCallId = object.value(QStringLiteral("tool_call_id")).toString();
+        entry.toolName = object.value(QStringLiteral("tool")).toString();
+        const QString image = object.value(QStringLiteral("image")).toString();
+        if (!image.isEmpty()) {
+            entry.image = QByteArray::fromBase64(image.toLatin1());
+        }
+        m_entries.append(entry);
+    }
+
+    if (!m_entries.isEmpty()) {
+        Q_EMIT entriesChanged();
+    }
+}
+
+void AiConversation::save() const
+{
+    if (!m_config.rememberHistory) {
+        return;
+    }
+
+    QJsonArray entries;
+    const int first = qMax(0, int(m_entries.size()) - SavedHistoryEntries);
+    for (int i = first; i < m_entries.size(); ++i) {
+        const Entry &entry = m_entries.at(i);
+        if (entry.role == Role::Note) {
+            continue;
+        }
+
+        QJsonObject object;
+        if (entry.role == Role::User) {
+            object.insert(QStringLiteral("role"), QStringLiteral("user"));
+        } else if (entry.role == Role::Assistant) {
+            object.insert(QStringLiteral("role"), QStringLiteral("assistant"));
+        } else {
+            object.insert(QStringLiteral("role"), QStringLiteral("tool"));
+        }
+        object.insert(QStringLiteral("text"), entry.text);
+        if (entry.timestamp.isValid()) {
+            object.insert(QStringLiteral("time"), entry.timestamp.toString(Qt::ISODateWithMs));
+        }
+        if (!entry.toolCallId.isEmpty()) {
+            object.insert(QStringLiteral("tool_call_id"), entry.toolCallId);
+        }
+        if (!entry.toolName.isEmpty()) {
+            object.insert(QStringLiteral("tool"), entry.toolName);
+        }
+        // Screenshots are not persisted: they are large, go stale instantly,
+        // and the model can always take a fresh one.
+        entries.append(object);
+    }
+
+    QJsonObject root;
+    root.insert(QStringLiteral("key"), m_key);
+    if (!m_title.isEmpty()) {
+        root.insert(QStringLiteral("title"), m_title);
+    }
+    root.insert(QStringLiteral("entries"), entries);
+
+    QFile file{historyFilePath()};
+    QDir().mkpath(QFileInfo(file).absolutePath());
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        qCWarning(KRDC) << "Could not write AI history" << file.fileName();
+        return;
+    }
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+}

@@ -91,6 +91,8 @@ option(WITH_RDP "Enable RDP support using FreeRDP" ON)
 add_feature_info(RDP WITH_RDP "Building with support for the RDP protocol. Disable with -DWITH_RDP=NO")
 option(WITH_SPICE "Enable SPICE support." ON)
 add_feature_info(SPICE WITH_SPICE "Building with support for the SPICE protocol. Disable with -DWITH_SPICE=NO")
+option(WITH_AI "Enable the AI assistant chat panel." ON)
+add_feature_info(AI WITH_AI "Building with the AI assistant chat panel. Disable with -DWITH_AI=NO")
 
 ecm_set_disabled_deprecation_versions(QT 6.8
      KF 6.12
@@ -215,6 +217,33 @@ ecm_qt_declare_logging_category(krdc
     DESCRIPTION "KRDC"
     EXPORT KRDC
 )
+
+if(WITH_AI)
+    target_sources(krdc PRIVATE
+        ai/aiconfig.cpp
+        ai/aitools.cpp
+        ai/aikeys.cpp
+        ai/aihttpclient.cpp
+        ai/aiconversation.cpp
+        ai/aiconversationpage.cpp
+        ai/aisettingsdialog.cpp
+        ai/aipanel.cpp
+    )
+
+    # The panel is compiled into the executable, not loaded at runtime: it needs
+    # the main window's action collection, dock areas and tab changes. Protocol
+    # backends plug in through RemoteView's ai*() methods instead.
+    target_compile_definitions(krdc PRIVATE -DBUILD_AI_ASSISTANT)
+    target_link_libraries(krdc Qt::Network)
+endif()
+
+# Tell the binary where its protocol plugins were installed, so plugin
+# discovery also works for prefixes outside Qt's own plugin search paths.
+# KDE_INSTALL_QTPLUGINDIR is empty at configure time on this ECM version (its
+# cache entry materialises during install), so the install script pre-seeds
+# it; the path is anchored to the executable directory either way.
+target_compile_definitions(krdc PRIVATE
+    KRDC_PLUGIN_INSTALL_DIR="$<TARGET_FILE_DIR:krdc>/../${KDE_INSTALL_QTPLUGINDIR}")
 
 target_link_libraries(krdc
     Qt::Network
