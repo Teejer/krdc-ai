@@ -28,6 +28,9 @@ class RemoteDesktopsModel;
 class RemoteView;
 class SystemTrayIcon;
 class TabbedViewWidget;
+#ifdef BUILD_AI_ASSISTANT
+class AiPanel;
+#endif
 
 class QDockWidget;
 class QScrollArea;
@@ -121,12 +124,18 @@ private:
     RemoteDesktopsModel *m_remoteDesktopsModel;
     QWidget *m_newConnectionWidget;
     QDockWidget *m_remoteDesktopsDockWidget;
+#ifdef BUILD_AI_ASSISTANT
+    AiPanel *m_aiPanel = nullptr;
+#endif
 
     struct GuiItemsState {
         bool dockWidget;
         bool menuBar;
         bool statusBar;
         bool toolBar;
+#ifdef BUILD_AI_ASSISTANT
+        bool aiPanel;
+#endif
     };
     GuiItemsState m_guiItemsState{};
     bool m_fullscreenActive = false;
