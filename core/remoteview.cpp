@@ -327,6 +327,68 @@ QUrl RemoteView::url()
     return m_url;
 }
 
+QString RemoteView::connectionKey() const
+{
+    if (m_url.isValid() && !m_url.host().isEmpty()) {
+        return m_url.toDisplayString(QUrl::StripTrailingSlash);
+    }
+    if (!m_host.isEmpty()) {
+        return QStringLiteral("%1:%2").arg(m_host).arg(m_port);
+    }
+    return QStringLiteral("unknown");
+}
+
+bool RemoteView::supportsAiControl() const
+{
+    return false;
+}
+
+void RemoteView::aiMouseMove(const QPoint &)
+{
+}
+
+void RemoteView::aiMouseButton(const QPoint &, Qt::MouseButton, bool)
+{
+}
+
+void RemoteView::aiMouseWheel(const QPoint &, const QPoint &)
+{
+}
+
+void RemoteView::aiKeyPress(int, Qt::KeyboardModifiers, bool)
+{
+}
+
+bool RemoteView::aiTypeText(const QString &)
+{
+    return false;
+}
+
+void RemoteView::setKeyboardGrabSuspended(bool suspended)
+{
+    if (m_keyboardGrabSuspended == suspended) {
+        return;
+    }
+    m_keyboardGrabSuspended = suspended;
+
+    if (suspended) {
+        // Let the keys reach whatever widget outside the remote view now has
+        // the focus, without touching the user's "grab all keys" setting.
+        if (m_keyboardIsGrabbed) {
+            m_keyboardIsGrabbed = false;
+            releaseKeyboard();
+        }
+    } else if (m_grabAllKeys && hasFocus()) {
+        m_keyboardIsGrabbed = true;
+        grabKeyboard();
+    }
+}
+
+bool RemoteView::keyboardGrabSuspended() const
+{
+    return m_keyboardGrabSuspended;
+}
+
 QString RemoteView::readWalletPassword(bool fromUserNameOnly)
 {
     return readWalletPasswordForKey(fromUserNameOnly ? m_url.userName() : m_url.toDisplayString(QUrl::StripTrailingSlash));
@@ -417,7 +479,7 @@ QCursor RemoteView::localDefaultCursor() const
 
 void RemoteView::focusInEvent(QFocusEvent *event)
 {
-    if (m_grabAllKeys) {
+    if (m_grabAllKeys && !m_keyboardGrabSuspended) {
         m_keyboardIsGrabbed = true;
         grabKeyboard();
     }

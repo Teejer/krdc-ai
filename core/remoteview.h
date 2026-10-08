@@ -291,6 +291,66 @@ public:
      */
     QUrl url();
 
+    /**
+     * @return a stable identifier for the connection this view belongs to.
+     * Used to associate per-connection state (e.g. the AI chat panel's
+     * conversation) with a connection rather than with this widget, so that
+     * reconnecting to the same server picks up where it left off.
+     */
+    QString connectionKey() const;
+
+    // ------------------------------------------------------------------
+    // AI assistant support
+    //
+    // Backends that can be driven by the AI assistant implement these. All
+    // coordinates are in remote framebuffer pixels, i.e. the same coordinate
+    // space as the pixmap returned by takeScreenshot(). This keeps the
+    // assistant independent of any local scaling or scrolling.
+    // ------------------------------------------------------------------
+
+    /**
+     * Checks whether the backend accepts synthesized pointer/keyboard input
+     * from the AI assistant. The default implementation returns false.
+     */
+    virtual bool supportsAiControl() const;
+
+    /**
+     * Warps the remote pointer to @p pos without pressing a button.
+     */
+    virtual void aiMouseMove(const QPoint &pos);
+
+    /**
+     * Presses or releases @p button at the remote coordinate @p pos.
+     */
+    virtual void aiMouseButton(const QPoint &pos, Qt::MouseButton button, bool pressed);
+
+    /**
+     * Sends a wheel event at the remote coordinate @p pos. @p angleDelta uses
+     * the Qt convention (120 units per notch).
+     */
+    virtual void aiMouseWheel(const QPoint &pos, const QPoint &angleDelta);
+
+    /**
+     * Presses or releases the key @p key (a Qt::Key value) on the remote
+     * machine, with @p modifiers held down.
+     */
+    virtual void aiKeyPress(int key, Qt::KeyboardModifiers modifiers, bool pressed);
+
+    /**
+     * Types @p text into the remote machine as fast as the protocol allows.
+     * @return false if some characters could not be injected.
+     */
+    virtual bool aiTypeText(const QString &text);
+
+    /**
+     * Temporarily gives up an exclusive keyboard grab, e.g. while the user is
+     * typing into a widget outside the remote view such as the AI chat panel.
+     * Unlike setGrabAllKeys() this does not change the user's setting: the
+     * grab is restored as soon as the view is focused again.
+     */
+    void setKeyboardGrabSuspended(bool suspended);
+    bool keyboardGrabSuspended() const;
+
 public Q_SLOTS:
     /**
      * Called to enable or disable scaling.
@@ -473,6 +533,7 @@ protected:
     int m_port;
     bool m_viewOnly;
     bool m_grabAllKeys;
+    bool m_keyboardGrabSuspended = false;
     bool m_scale;
     bool m_keyboardIsGrabbed;
     QUrl m_url;
