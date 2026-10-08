@@ -330,7 +330,7 @@ void RemoteView::setViewOnly(bool viewOnly)
 
 bool RemoteView::keyboardCaptured() const
 {
-    return m_status == Connected && !m_viewOnly && !m_keyboardReleased;
+    return m_status == Connected && !m_viewOnly && !m_keyboardReleased && !m_keyboardGrabSuspended;
 }
 
 bool RemoteView::keyboardReleased() const
@@ -461,6 +461,62 @@ bool RemoteView::acceptPasswordDialog(const KPasswordDialog &dialog)
     }
     hostPreferences()->setWalletSupport(dialog.keepPassword());
     return dialog.keepPassword();
+}
+
+QString RemoteView::connectionKey() const
+{
+    if (m_url.isValid() && !m_url.host().isEmpty()) {
+        return m_url.toDisplayString(QUrl::StripTrailingSlash);
+    }
+    if (!m_host.isEmpty()) {
+        return QStringLiteral("%1:%2").arg(m_host).arg(m_port);
+    }
+    return QStringLiteral("unknown");
+}
+
+bool RemoteView::supportsAiControl() const
+{
+    return false;
+}
+
+void RemoteView::aiMouseMove(const QPoint &)
+{
+}
+
+void RemoteView::aiMouseButton(const QPoint &, Qt::MouseButton, bool)
+{
+}
+
+void RemoteView::aiMouseWheel(const QPoint &, const QPoint &)
+{
+}
+
+void RemoteView::aiKeyPress(int, Qt::KeyboardModifiers, bool)
+{
+}
+
+bool RemoteView::aiTypeText(const QString &)
+{
+    return false;
+}
+
+void RemoteView::setKeyboardGrabSuspended(bool suspended)
+{
+    if (m_keyboardGrabSuspended == suspended) {
+        return;
+    }
+    m_keyboardGrabSuspended = suspended;
+
+    // Let the keys reach whatever widget outside the remote view now has the
+    // focus, without touching the user's shortcut settings: while suspended
+    // keyboardCaptured() is false, and resuming lets updateKeyboardGrab()
+    // restore the grab wherever the settings still call for one.
+    updateKeyboardGrab();
+}
+
+bool RemoteView::keyboardGrabSuspended() const
+{
+    return m_keyboardGrabSuspended;
 }
 
 QString RemoteView::readWalletPassword(bool fromUserNameOnly)
