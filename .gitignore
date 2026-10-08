@@ -1,0 +1,9 @@
+# nested repos with their own remotes (KDE clone, AUR repo)
+krdc/
+pkg/src/
+pkg/pkg/
+pkg/.git/
+
+# build artifacts
+*.pkg.tar.zst
+build/
