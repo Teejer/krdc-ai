@@ -7,6 +7,9 @@
 */
 
 #include "mainwindow.h"
+#ifdef BUILD_AI_ASSISTANT
+#include "ai/aipanel.h"
+#endif
 #include "bookmarkmanager.h"
 #include "config/preferencesdialog.h"
 #include "connectiondelegate.h"
@@ -34,6 +37,9 @@
 #include <KToolBar>
 
 #include <QAbstractItemView>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QClipboard>
 #include <QDockWidget>
 #include <QFontMetrics>
@@ -115,6 +121,17 @@ MainWindow::MainWindow(QWidget *parent)
     m_keyboardHint = new OverlayMessage(m_tabWidget);
 
     createDockWidget();
+
+#ifdef BUILD_AI_ASSISTANT
+    m_aiPanel = new AiPanel(this);
+    m_aiPanel->registerAction(actionCollection());
+    addDockWidget(Qt::RightDockWidgetArea, m_aiPanel->dock());
+    // The assistant is opt-in: hidden until the user turns it on via
+    // Settings -> AI Assistant. setupGUI() below restores saved window state,
+    // which includes each dock's hidden flag, so once it has been shown the
+    // choice is remembered across restarts like any other dock widget.
+    m_aiPanel->dock()->hide();
+#endif
 
     setupGUI(ToolBar | Keys | Save | Create);
 
@@ -234,6 +251,22 @@ void MainWindow::setupActions()
 
 void MainWindow::loadAllPlugins()
 {
+    // KPluginMetaData::findPlugins() only searches Qt's own plugin paths and
+    // the application directory, which misses the KDE plugin dir of a prefix
+    // outside Qt's build (e.g. /usr/local). Register the install-time plugin
+    // directory explicitly so the protocol plugins are found regardless of
+    // where KRDC was installed. The compiled-in path may be relative to the
+    // executable, so resolve it against the application directory.
+#ifdef KRDC_PLUGIN_INSTALL_DIR
+    QString pluginDir = QFileInfo(QStringLiteral(KRDC_PLUGIN_INSTALL_DIR)).isAbsolute()
+                            ? QStringLiteral(KRDC_PLUGIN_INSTALL_DIR)
+                            : QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral(KRDC_PLUGIN_INSTALL_DIR));
+    pluginDir = QDir::cleanPath(pluginDir);
+    if (!QCoreApplication::libraryPaths().contains(pluginDir)) {
+        QCoreApplication::addLibraryPath(pluginDir);
+    }
+#endif
+
     const QVector<KPluginMetaData> offers = KPluginMetaData::findPlugins(QStringLiteral("krdc"));
     const KConfigGroup conf = KSharedConfig::openConfig()->group(QStringLiteral("Plugins"));
 
@@ -669,6 +702,11 @@ void MainWindow::applyFullscreenState(bool fullscreen)
         }
 
         m_remoteDesktopsDockWidget->setVisible(m_guiItemsState.dockWidget);
+#ifdef BUILD_AI_ASSISTANT
+        if (m_guiItemsState.aiPanel) {
+            m_aiPanel->dock()->show();
+        }
+#endif
         menuBar()->setVisible(m_guiItemsState.menuBar);
         statusBar()->setVisible(m_guiItemsState.statusBar);
         toolBars().first()->setVisible(m_guiItemsState.toolBar);
@@ -702,7 +740,12 @@ void MainWindow::applyFullscreenState(bool fullscreen)
         m_guiItemsState = {.dockWidget = !m_remoteDesktopsDockWidget->isHidden(),
                            .menuBar = !menuBar()->isHidden(),
                            .statusBar = !statusBar()->isHidden(),
-                           .toolBar = !toolBars().first()->isHidden()};
+                           .toolBar = !toolBars().first()->isHidden()
+#ifdef BUILD_AI_ASSISTANT
+                           ,
+                           .aiPanel = !m_aiPanel->dock()->isHidden()
+#endif
+        };
 
         // Keep the group while autosaving is disabled: autoSaveConfigGroup()
         // returns an invalid group until autosaving is enabled again.
@@ -713,6 +756,9 @@ void MainWindow::applyFullscreenState(bool fullscreen)
         }
 
         m_remoteDesktopsDockWidget->setVisible(false);
+#ifdef BUILD_AI_ASSISTANT
+        m_aiPanel->dock()->setVisible(false);
+#endif
         menuBar()->setVisible(false);
         statusBar()->setVisible(false);
         toolBars().first()->setVisible(false);
@@ -862,6 +908,9 @@ void MainWindow::closeTab(int index)
     if (!isNewConnectionPage) {
         RemoteView *view = m_remoteViewMap.take(widget);
         if (view) {
+#ifdef BUILD_AI_ASSISTANT
+            m_aiPanel->removeConnection(view->connectionKey());
+#endif
             view->startQuitting();
         } else if (!qobject_cast<RemoteViewScrollArea *>(widget)) {
             return;
@@ -1428,6 +1477,12 @@ void MainWindow::tabChanged(int index)
 
     const QString tabTitle = m_tabWidget->tabText(index).remove(QLatin1Char('&'));
     setCaption(tabTitle == i18n("New Connection") ? QString() : tabTitle);
+
+#ifdef BUILD_AI_ASSISTANT
+    // Show the chat that belongs to this connection; each remote machine
+    // keeps its own conversation.
+    m_aiPanel->setActiveView(currentRemoteView(), tabTitle);
+#endif
 
     updateActionStatus();
     updateKeyboardHint();
