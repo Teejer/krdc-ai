@@ -16,6 +16,7 @@
 #include <QLabel>
 #include <QLocale>
 #include <QPlainTextEdit>
+#include <QPixmap>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QTextBrowser>
@@ -97,6 +98,14 @@ AiConversationPage::AiConversationPage(AiConversation *conversation, QWidget *pa
     approvalLayout->addWidget(new QLabel(QStringLiteral("<b>%1</b>").arg(i18n("The assistant wants to:")), m_approvalBar));
     approvalLayout->addWidget(m_approvalText);
     approvalLayout->addWidget(m_approvalReason);
+
+    // A zoomed crop of the screen around the point a pending click targets,
+    // so the user sees what is there, not just a coordinate.
+    m_approvalPreview = new QLabel(m_approvalBar);
+    m_approvalPreview->setAlignment(Qt::AlignCenter);
+    m_approvalPreview->setStyleSheet(QStringLiteral("border:1px solid palette(mid);"));
+    m_approvalPreview->setVisible(false);
+    approvalLayout->addWidget(m_approvalPreview);
     approvalLayout->addLayout(approvalButtons);
 
     m_approvalBar->setStyleSheet(QStringLiteral("background:#54411f;border-radius:6px;"));
@@ -214,6 +223,20 @@ void AiConversationPage::reloadApprovalBar()
     if (awaiting) {
         m_approvalText->setText(m_conversation->pendingSummary());
         m_approvalReason->setText(m_conversation->pendingReason());
+
+        const QPixmap preview = m_conversation->pendingPreview();
+        if (preview.isNull()) {
+            m_approvalPreview->setVisible(false);
+        } else {
+            // Fit the crop to the panel width without upscaling tiny crops
+            // past their own size; the crosshair stays accurate either way.
+            const int widest = qMin(preview.width() * 2, 300);
+            m_approvalPreview->setPixmap(
+                preview.scaled(widest, preview.height() * 2, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            m_approvalPreview->setVisible(true);
+        }
+    } else {
+        m_approvalPreview->setVisible(false);
     }
 
     m_approvalBar->setVisible(awaiting);

@@ -231,6 +231,10 @@ QJsonArray AiTools::schemas()
                                    QJsonArray{QStringLiteral("left"), QStringLiteral("right"), QStringLiteral("middle")}));
         properties.insert(QStringLiteral("clicks"),
                           property(QStringLiteral("integer"), QStringLiteral("1 for a single click, 2 for a double click.")));
+        properties.insert(QStringLiteral("target"),
+                          property(QStringLiteral("string"),
+                                   QStringLiteral("What you are clicking, in a few words, e.g. \"the OK button\". Shown to the "
+                                                  "user for approval.")));
         tools.append(wrapped(QStringLiteral("mouse_click"), QStringLiteral("Click at a point on the remote screen."), properties,
                              {QStringLiteral("x"), QStringLiteral("y")}));
     }
@@ -244,6 +248,10 @@ QJsonArray AiTools::schemas()
         properties.insert(QStringLiteral("button"),
                           property(QStringLiteral("string"), QStringLiteral("Which button to drag with."),
                                    QJsonArray{QStringLiteral("left"), QStringLiteral("right"), QStringLiteral("middle")}));
+        properties.insert(QStringLiteral("target"),
+                          property(QStringLiteral("string"),
+                                   QStringLiteral("What you are dragging and where, in a few words, e.g. \"the file into the "
+                                                  "folder\". Shown to the user for approval.")));
         tools.append(
             wrapped(QStringLiteral("mouse_drag"), QStringLiteral("Press, move and release to drag something on the remote screen."), properties,
                     {QStringLiteral("from_x"), QStringLiteral("from_y"), QStringLiteral("to_x"), QStringLiteral("to_y")}));
@@ -398,13 +406,17 @@ QString AiTools::describe(const QString &name, const QJsonObject &arguments)
     if (name == QLatin1String("mouse_click")) {
         const QString button = arguments.value(QStringLiteral("button")).toString();
         const int clicks = int(arguments.value(QStringLiteral("clicks")).toDouble(1));
-        return QStringLiteral("Click %1 button at (%2, %3)%4")
+        const QString target = arguments.value(QStringLiteral("target")).toString().trimmed();
+        return QStringLiteral("Click %1 button at (%2, %3)%4%5")
             .arg(button.isEmpty() ? QStringLiteral("left") : button, number(QStringLiteral("x")), number(QStringLiteral("y")),
-                 clicks > 1 ? QStringLiteral(" (%1×)").arg(clicks) : QString());
+                 clicks > 1 ? QStringLiteral(" (%1×)").arg(clicks) : QString(),
+                 target.isEmpty() ? QString() : QStringLiteral(" — “%1”").arg(truncated(target, 60)));
     }
     if (name == QLatin1String("mouse_drag")) {
-        return QStringLiteral("Drag from (%1, %2) to (%3, %4)")
-            .arg(number(QStringLiteral("from_x")), number(QStringLiteral("from_y")), number(QStringLiteral("to_x")), number(QStringLiteral("to_y")));
+        const QString target = arguments.value(QStringLiteral("target")).toString().trimmed();
+        return QStringLiteral("Drag from (%1, %2) to (%3, %4)%5")
+            .arg(number(QStringLiteral("from_x")), number(QStringLiteral("from_y")), number(QStringLiteral("to_x")), number(QStringLiteral("to_y")),
+                 target.isEmpty() ? QString() : QStringLiteral(" — “%1”").arg(truncated(target, 60)));
     }
     if (name == QLatin1String("mouse_scroll")) {
         return QStringLiteral("Scroll %1 at (%2, %3)")

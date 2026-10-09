@@ -21,6 +21,8 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QJsonObject>
+#include <QPainter>
+#include <QPixmap>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTimer>
@@ -138,6 +140,79 @@ QString AiConversation::pendingReason() const
         return AiTools::dangerReason(pending.call.name, pending.call.arguments);
     }
     return {};
+}
+
+QPixmap AiConversation::pendingPreview() const
+{
+    if (m_queueIndex >= m_queue.size()) {
+        return {};
+    }
+    const PendingTool &pending = m_queue.at(m_queueIndex);
+    const QString name = pending.call.name;
+    if (name != QLatin1String("mouse_click") && name != QLatin1String("mouse_drag") && name != QLatin1String("mouse_scroll")) {
+        return {};
+    }
+    if (!m_view || m_view->status() != RemoteView::Connected) {
+        return {};
+    }
+
+    // Work in screen pixels: the full-resolution grab, with the model's
+    // screenshot coordinates mapped in the same way runTool will map the
+    // action itself, so the crosshair marks exactly where the click lands.
+    const QPixmap screen = m_view->takeScreenshot();
+    if (screen.isNull()) {
+        return {};
+    }
+
+    QList<QPoint> points;
+    if (name == QLatin1String("mouse_drag")) {
+        const QJsonObject args = pending.call.arguments;
+        points.append(toScreen(QPoint{int(args.value(QStringLiteral("from_x")).toDouble()),
+                                      int(args.value(QStringLiteral("from_y")).toDouble())}));
+        points.append(toScreen(QPoint{int(args.value(QStringLiteral("to_x")).toDouble()),
+                                      int(args.value(QStringLiteral("to_y")).toDouble())}));
+    } else {
+        const QJsonObject args = pending.call.arguments;
+        points.append(toScreen(QPoint{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())}));
+    }
+
+    // A crop that holds every marked point with margin, so a drag shows both
+    // ends, capped so a huge drag does not shrink the target to nothing.
+    QRect bounds{QRect(points.first(), QSize{1, 1})};
+    for (const QPoint &point : points) {
+        bounds = bounds.united(QRect{point, QSize{1, 1}});
+    }
+    constexpr int Margin = 90;
+    bounds = bounds.adjusted(-Margin, -Margin, Margin, Margin).intersected(screen.rect());
+    if (bounds.isEmpty()) {
+        return {};
+    }
+    if (bounds.width() > 480 || bounds.height() > 360) {
+        // Too big to read a control in: fall back to a fixed crop on the
+        // first point (the click itself), which is always a single point.
+        const QPoint anchor = points.first();
+        bounds = QRect{anchor.x() - 160, anchor.y() - 120, 320, 240}.intersected(screen.rect());
+    }
+
+    QPixmap crop = screen.copy(bounds);
+
+    QPainter painter{&crop};
+    painter.setRenderHint(QPainter::Antialiasing);
+    QPen pen{QColor{255, 60, 60}, 2.0};
+    painter.setPen(pen);
+    for (const QPoint &point : points) {
+        const QPoint local = point - bounds.topLeft();
+        if (!bounds.contains(point)) {
+            continue;
+        }
+        constexpr int Arm = 12;
+        painter.drawLine(local.x() - Arm, local.y(), local.x() + Arm, local.y());
+        painter.drawLine(local.x(), local.y() - Arm, local.x(), local.y() + Arm);
+        painter.drawEllipse(local, 8, 8);
+    }
+    painter.end();
+
+    return crop;
 }
 
 void AiConversation::setConfig(const AiConfig &config)
