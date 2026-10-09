@@ -15,6 +15,7 @@
 #include <QList>
 #include <QObject>
 #include <QPointer>
+#include <QSize>
 #include <QString>
 
 class RemoteView;
@@ -90,11 +91,22 @@ public:
     void cancel();
     void clear();
 
-    /** @return a JPEG of the remote screen, scaled down for the model. */
-    QByteArray grabScreenshot() const;
+    /** @return a JPEG of the remote screen, scaled down for the model.
+     * Records the returned image's size so pointer coordinates the model
+     * reads off it can be mapped back to screen pixels. */
+    QByteArray grabScreenshot();
 
     /** @return the size of the remote screen, or an invalid size. */
     QSize screenSize() const;
+
+    /**
+     * Maps a position the model read off the last screenshot it received
+     * to remote screen pixels. Screenshots are downscaled, so a coordinate
+     * taken from one is off by that factor; the model cannot be trusted
+     * with that arithmetic. Positions arrive in screen pixels when no
+     * screenshot has been sent (or it was sent unscaled).
+     */
+    QPoint toScreen(const QPoint &pos) const;
 
 Q_SIGNALS:
     void entriesChanged();
@@ -136,6 +148,7 @@ private:
     AiHttpClient m_client;
     QString m_key;
     AiConfig m_config;
+    QSize m_sentImageSize;
     QList<Entry> m_entries;
     QPointer<RemoteView> m_view;
     QString m_title;

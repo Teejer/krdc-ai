@@ -93,7 +93,7 @@ QString AiConfig::modelsUrl() const
 
 QString AiConfig::defaultSystemPrompt()
 {
-    return QStringLiteral(
+    QString prompt = QStringLiteral(
         "You are an assistant embedded in KRDC, a remote desktop client. You are looking at the "
         "screen of a remote machine that the user is connected to, usually over RDP.\n\n"
         "Rules:\n"
@@ -113,4 +113,16 @@ QString AiConfig::defaultSystemPrompt()
         "- If an action needs a password or would delete or overwrite something, stop and let "
         "the user do it or confirm it.\n"
         "- Keep answers short. Report what you did and what the screen now shows.");
+    if (prompt.contains(QLatin1String("If the reported image size differs"))) {
+        // The old wording made the model rescale coordinates itself, and
+        // models are bad at that arithmetic: clicks landed off target by the
+        // downscale factor. The point tools map screenshot pixels to screen
+        // pixels now, so the model must not.
+        return prompt.replace(
+            QLatin1String("If the reported image size differs from the screen size, scale the coordinates you read off the "
+                          "image accordingly."),
+            QStringLiteral("Point tools take coordinates in this image's pixels and are mapped to the real screen "
+                           "for you; do not scale coordinates yourself."));
+    }
+    return prompt;
 }
