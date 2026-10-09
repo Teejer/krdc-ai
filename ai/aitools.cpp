@@ -313,6 +313,19 @@ QJsonArray AiTools::schemas()
 
     {
         QJsonObject properties;
+        properties.insert(QStringLiteral("filename"),
+                          property(QStringLiteral("string"),
+                                   QStringLiteral("File name for the image, without a path, e.g. \"step-1-start-menu\". The "
+                                                  "extension is added automatically. Leave empty for a timestamped name.")));
+        tools.append(wrapped(QStringLiteral("save_screenshot"),
+                             QStringLiteral("Save a full-resolution screenshot of the remote screen as a PNG file on the "
+                                            "local computer, in the configured screenshot folder. Use it to document steps "
+                                            "for a guide; the reply gives the full path to quote in the write-up."),
+                             properties));
+    }
+
+    {
+        QJsonObject properties;
         properties.insert(QStringLiteral("seconds"), property(QStringLiteral("number"), QStringLiteral("How long to wait.")));
         properties.insert(QStringLiteral("reason"), property(QStringLiteral("string"), QStringLiteral("What you are waiting for.")));
         tools.append(wrapped(QStringLiteral("wait"),
@@ -331,7 +344,7 @@ bool AiTools::isKnownTool(const QString &name)
         QStringLiteral("take_screenshot"), QStringLiteral("screen_info"),      QStringLiteral("mouse_move"),
         QStringLiteral("mouse_click"),     QStringLiteral("mouse_drag"),       QStringLiteral("mouse_scroll"),
         QStringLiteral("type_text"),       QStringLiteral("press_key"),        QStringLiteral("hotkey"),
-        QStringLiteral("wait"),
+        QStringLiteral("save_screenshot"), QStringLiteral("wait"),
     };
     return names.contains(name);
 }
@@ -416,6 +429,13 @@ QString AiTools::describe(const QString &name, const QJsonObject &arguments)
             return QStringLiteral("Press %1").arg(keys.toString());
         }
         return QStringLiteral("Press %1").arg(chord.join(QLatin1Char('+')));
+    }
+    if (name == QLatin1String("save_screenshot")) {
+        const QString filename = arguments.value(QStringLiteral("filename")).toString().trimmed();
+        if (filename.isEmpty()) {
+            return QStringLiteral("Save a screenshot to a new file on this computer");
+        }
+        return QStringLiteral("Save a screenshot as “%1” on this computer").arg(truncated(filename, 40));
     }
     if (name == QLatin1String("wait")) {
         return QStringLiteral("Wait %1 s").arg(arguments.value(QStringLiteral("seconds")).toDouble());

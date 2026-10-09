@@ -15,6 +15,7 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -96,6 +97,26 @@ AiSettingsDialog::AiSettingsDialog(QWidget *parent)
     m_rememberHistory = new QCheckBox(i18n("&Remember each connection's chat history between restarts"), behaviourGroup);
     behaviourLayout->addWidget(m_rememberHistory);
 
+    // Folder for the save_screenshot tool, which the assistant uses to
+    // document steps for guides.
+    auto *pathRow = new QHBoxLayout();
+    auto *pathLabel = new QLabel(i18n("Screenshot &folder:"), behaviourGroup);
+    m_screenshotPath = new QLineEdit(behaviourGroup);
+    m_screenshotPath->setPlaceholderText(AiConfig::defaultScreenshotPath());
+    pathLabel->setBuddy(m_screenshotPath);
+    auto *browseButton = new QPushButton(i18n("&Browse…"), behaviourGroup);
+    pathRow->addWidget(pathLabel);
+    pathRow->addWidget(m_screenshotPath, 1);
+    pathRow->addWidget(browseButton);
+    behaviourLayout->addLayout(pathRow);
+    connect(browseButton, &QPushButton::clicked, this, [this] {
+        const QString directory = QFileDialog::getExistingDirectory(this, i18n("Screenshot Folder"),
+                                                                    m_screenshotPath->text().trimmed());
+        if (!directory.isEmpty()) {
+            m_screenshotPath->setText(directory);
+        }
+    });
+
     // --- Advanced, collapsed unless the user opens it ---
     auto *advancedToggle = new QCheckBox(i18n("&Show advanced settings"), this);
     layout->addWidget(advancedToggle);
@@ -173,6 +194,10 @@ AiConfig AiSettingsDialog::config() const
     config.autoExecute = m_autoExecute->isChecked();
     config.attachScreenshot = m_attachScreenshot->isChecked();
     config.rememberHistory = m_rememberHistory->isChecked();
+    config.screenshotPath = m_screenshotPath->text().trimmed();
+    if (config.screenshotPath.isEmpty()) {
+        config.screenshotPath = AiConfig::defaultScreenshotPath();
+    }
     config.maxTokens = m_maxTokens->value();
     config.temperature = m_temperature->value();
     config.timeoutSeconds = m_timeout->value();
@@ -189,6 +214,7 @@ void AiSettingsDialog::setConfig(const AiConfig &config)
     m_autoExecute->setChecked(config.autoExecute);
     m_attachScreenshot->setChecked(config.attachScreenshot);
     m_rememberHistory->setChecked(config.rememberHistory);
+    m_screenshotPath->setText(config.screenshotPath);
     m_maxTokens->setValue(config.maxTokens);
     m_temperature->setValue(config.temperature);
     m_timeout->setValue(config.timeoutSeconds);

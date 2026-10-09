@@ -400,6 +400,7 @@ static void testUnknownToolIsReported(AiConfig config)
     // The mock server only offers known tools, so exercise the parser guard
     // through the tool schema table instead.
     check(!AiTools::isKnownTool(QStringLiteral("launch_nukes")), "an invented tool is not known");
+    check(AiTools::isKnownTool(QStringLiteral("save_screenshot")), "the screenshot save tool is known");
     check(AiTools::schemas().size() >= 8, "the schema list offers the expected number of tools");
     check(!AiTools::isKnownTool(QString()), "the empty name is not a tool");
 }

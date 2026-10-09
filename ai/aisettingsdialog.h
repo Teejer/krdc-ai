@@ -50,6 +50,7 @@ private:
     QCheckBox *m_autoExecute = nullptr;
     QCheckBox *m_attachScreenshot = nullptr;
     QCheckBox *m_rememberHistory = nullptr;
+    QLineEdit *m_screenshotPath = nullptr;
     QSpinBox *m_maxTokens = nullptr;
     QDoubleSpinBox *m_temperature = nullptr;
     QSpinBox *m_timeout = nullptr;

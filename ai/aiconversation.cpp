@@ -13,6 +13,7 @@
 
 #include <QBuffer>
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -20,6 +21,7 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -542,6 +544,59 @@ void AiConversation::runTool(const PendingTool &pending)
             finishTool(call, QStringLiteral("Screenshot attached. Remote screen is %1x%2 pixels.").arg(screenSize().width()).arg(screenSize().height()),
                        image);
         }
+        return;
+    }
+
+    if (name == QLatin1String("save_screenshot")) {
+        if (!m_view || m_view->status() != RemoteView::Connected) {
+            failTool(call, QStringLiteral("No screenshot available. Is the connection established?"));
+            return;
+        }
+
+        // The saved file is the full-resolution PNG, unlike the downscaled
+        // JPEG that goes to the model: the point of this tool is a readable
+        // image for a guide.
+        QPixmap pixmap = m_view->takeScreenshot();
+        if (pixmap.isNull()) {
+            failTool(call, QStringLiteral("No screenshot available. Is the connection established?"));
+            return;
+        }
+
+        // The model supplies only a base name; anything path-shaped is
+        // stripped so the file always lands in the configured folder.
+        QString base = args.value(QStringLiteral("filename")).toString().trimmed();
+        base.remove(QRegularExpression(QStringLiteral("[/\\\\]")));
+        base.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._ -]")), QStringLiteral("_"));
+        base = base.trimmed();
+        while (base.startsWith(QLatin1Char('.'))) {
+            base.remove(0, 1);
+        }
+        if (base.length() > 64) {
+            base.truncate(64);
+        }
+        if (base.isEmpty()) {
+            base = QDateTime::currentDateTime().toString(QStringLiteral("screenshot-yyyy-MM-dd-HHmmss"));
+        }
+
+        QDir directory(m_config.screenshotPath);
+        if (!directory.exists() && !directory.mkpath(QStringLiteral("."))) {
+            failTool(call, QStringLiteral("Could not create the screenshot folder %1.").arg(directory.absolutePath()));
+            return;
+        }
+
+        QString fileName = base + QStringLiteral(".png");
+        int suffix = 2;
+        while (directory.exists(fileName)) {
+            fileName = base + QLatin1Char('-') + QString::number(suffix++) + QStringLiteral(".png");
+        }
+
+        QFile file{directory.filePath(fileName)};
+        if (!file.open(QIODevice::WriteOnly) || !pixmap.save(&file, "PNG")) {
+            failTool(call, QStringLiteral("Could not write %1.").arg(file.fileName()));
+            return;
+        }
+
+        finishTool(call, QStringLiteral("Saved %1 (%2x%3).").arg(file.fileName()).arg(pixmap.width()).arg(pixmap.height()));
         return;
     }
 
