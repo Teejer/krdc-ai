@@ -15,6 +15,7 @@
 #include <QList>
 #include <QObject>
 #include <QPointer>
+#include <QPixmap>
 #include <QSize>
 #include <QString>
 
@@ -75,6 +76,14 @@ public:
     QString pendingSummary() const;
     /** Why the pending tool call needs approval even with auto-execute on. */
     QString pendingReason() const;
+
+    /**
+     * A zoomed crop of the current remote screen around the point the pending
+     * click or drag is about to act on, with a crosshair on it, so the user
+     * can see what is there before approving. Returns a null pixmap when the
+     * pending call is not a point action or no screen is available.
+     */
+    QPixmap pendingPreview() const;
 
     void setConfig(const AiConfig &config);
     const AiConfig &config() const;

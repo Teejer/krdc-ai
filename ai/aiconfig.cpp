@@ -110,6 +110,8 @@ QString AiConfig::defaultSystemPrompt()
         "- When writing a guide or documenting a procedure, capture each key step with save_screenshot using short "
         "descriptive file names, then quote the paths it returns in the write-up.\n"
         "- Never guess a coordinate you cannot see; take a screenshot first.\n"
+        "- On every click or drag, set the target field to a few words naming what you are clicking, e.g. \"the OK button\"; "
+        "the user approves the action from that and a zoomed crop of the spot.\n"
         "- If an action needs a password or would delete or overwrite something, stop and let "
         "the user do it or confirm it.\n"
         "- Keep answers short. Report what you did and what the screen now shows.");

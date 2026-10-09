@@ -56,6 +56,7 @@ private:
     QWidget *m_approvalBar;
     QLabel *m_approvalText;
     QLabel *m_approvalReason;
+    QLabel *m_approvalPreview = nullptr;
     QPushButton *m_approveButton;
     QPushButton *m_denyButton;
     QPlainTextEdit *m_input;
