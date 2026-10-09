@@ -49,6 +49,68 @@ int clampInt(double value, int minimum, int maximum, int fallback)
     return std::clamp(int(value), minimum, maximum);
 }
 
+// Reads one coordinate the model claims is a number. Models that have not
+// looked at the screen send placeholders instead: measured in the wild, this
+// model answers "[redacted]" rather than invent a number it cannot see, and
+// QJsonValue::toDouble() turns that into 0.0, which used to land the click in
+// the top-left corner with a confident "Clicked at (0, 0)" afterwards.
+bool numberArg(const QJsonObject &args, const QString &name, int *value)
+{
+    const QJsonValue entry = args.value(name);
+    if (entry.isDouble()) {
+        *value = int(entry.toDouble());
+        return true;
+    }
+    if (entry.isString()) {
+        bool ok = false;
+        const double parsed = entry.toString().trimmed().toDouble(&ok);
+        if (ok) {
+            *value = int(parsed);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Reads a point, refusing coordinates that are not numbers or fall outside
+// the screen. The error tells the model to look at the screen first, which is
+// the only way it can produce a real coordinate.
+bool pointArg(const QJsonObject &args, const QString &xName, const QString &yName, QPoint *point, QString *error, const QSize &screen)
+{
+    int x = 0;
+    int y = 0;
+    if (!numberArg(args, xName, &x) || !numberArg(args, yName, &y)) {
+        *error = QStringLiteral("The coordinates %1 and %2 must be numbers taken from a screenshot; what was given is not one. "
+                                "Call take_screenshot first and read the position off that image.")
+                     .arg(xName, yName);
+        return false;
+    }
+    if (screen.isValid() && !screen.isEmpty() && (x < 0 || y < 0 || x > screen.width() || y > screen.height())) {
+        *error = QStringLiteral("(%1, %2) is outside the screen, which is %3x%4. Take a screenshot and read the position "
+                                "off that image.")
+                     .arg(x)
+                     .arg(y)
+                     .arg(screen.width())
+                     .arg(screen.height());
+        return false;
+    }
+    *point = QPoint{x, y};
+    return true;
+}
+
+// Strips special-token markup that leaks into visible text. Observed from
+// mlx-serve with thinking enabled: the end-of-turn token arrives as literal
+// text at the end of a reply, sometimes instead of the tool call the model
+// meant to emit. Leaving it in the history teaches the model to repeat it, so
+// it is removed on the way in.
+QString stripStrayTokens(const QString &text)
+{
+    static const QRegularExpression token(QStringLiteral("<\\/?s>|<\\|im_end\\|>|<\\|endoftext\\|>"));
+    QString out = text;
+    out.remove(token);
+    return out.trimmed();
+}
+
 Qt::MouseButton buttonFromName(const QString &name, bool *ok = nullptr)
 {
     if (ok) {
@@ -164,16 +226,35 @@ QPixmap AiConversation::pendingPreview() const
         return {};
     }
 
+    const QJsonObject args = pending.call.arguments;
     QList<QPoint> points;
+    const QSize aim = aimSize();
+    auto read = [&args, &aim](const QString &xName, const QString &yName) -> QPoint {
+        int x = 0;
+        int y = 0;
+        if (!numberArg(args, xName, &x) || !numberArg(args, yName, &y)) {
+            return QPoint{-1, -1};
+        }
+        if (aim.isValid() && !aim.isEmpty() && (x < 0 || y < 0 || x > aim.width() || y > aim.height())) {
+            return QPoint{-1, -1};
+        }
+        return QPoint{x, y};
+    };
+
     if (name == QLatin1String("mouse_drag")) {
-        const QJsonObject args = pending.call.arguments;
-        points.append(toScreen(QPoint{int(args.value(QStringLiteral("from_x")).toDouble()),
-                                      int(args.value(QStringLiteral("from_y")).toDouble())}));
-        points.append(toScreen(QPoint{int(args.value(QStringLiteral("to_x")).toDouble()),
-                                      int(args.value(QStringLiteral("to_y")).toDouble())}));
+        const QPoint from = read(QStringLiteral("from_x"), QStringLiteral("from_y"));
+        const QPoint to = read(QStringLiteral("to_x"), QStringLiteral("to_y"));
+        if (from.x() < 0 || to.x() < 0) {
+            return {};
+        }
+        points.append(toScreen(from));
+        points.append(toScreen(to));
     } else {
-        const QJsonObject args = pending.call.arguments;
-        points.append(toScreen(QPoint{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())}));
+        const QPoint pos = read(QStringLiteral("x"), QStringLiteral("y"));
+        if (pos.x() < 0) {
+            return {};
+        }
+        points.append(toScreen(pos));
     }
 
     // A crop that holds every marked point with margin, so a drag shows both
@@ -366,6 +447,17 @@ QPoint AiConversation::toScreen(const QPoint &pos) const
     return QPoint{std::clamp(x, 0, screen.width() - 1), std::clamp(y, 0, screen.height() - 1)};
 }
 
+QSize AiConversation::aimSize() const
+{
+    // Coordinates are quoted in the pixels of the screenshot the model was
+    // last given, which is the only picture it can read a position from;
+    // before any screenshot has been sent, the screen itself is the bound.
+    if (m_sentImageSize.isValid() && !m_sentImageSize.isEmpty()) {
+        return m_sentImageSize;
+    }
+    return screenSize();
+}
+
 QSize AiConversation::screenSize() const
 {
     if (!m_view) {
@@ -484,8 +576,11 @@ void AiConversation::onReply(const QString &content, const QList<AiToolCall> &to
 {
     Entry entry;
     entry.role = Role::Assistant;
-    entry.text = content;
+    entry.text = stripStrayTokens(content);
     entry.toolCalls = toolCalls;
+    for (AiToolCall &call : entry.toolCalls) {
+        call.name = stripStrayTokens(call.name);
+    }
     m_entries.append(entry);
     Q_EMIT entriesChanged();
 
@@ -719,7 +814,13 @@ void AiConversation::runTool(const PendingTool &pending)
     }
 
     if (name == QLatin1String("mouse_move")) {
-        const QPoint pos = toScreen(QPoint{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())});
+        QPoint raw;
+        QString error;
+        if (!pointArg(args, QStringLiteral("x"), QStringLiteral("y"), &raw, &error, aimSize())) {
+            failTool(call, error);
+            return;
+        }
+        const QPoint pos = toScreen(raw);
         view->aiMouseMove(pos);
         finishTool(call, QStringLiteral("Pointer moved to (%1, %2).").arg(pos.x()).arg(pos.y()));
         return;
@@ -733,7 +834,13 @@ void AiConversation::runTool(const PendingTool &pending)
             return;
         }
 
-        const QPoint pos = toScreen(QPoint{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())});
+        QPoint raw;
+        QString error;
+        if (!pointArg(args, QStringLiteral("x"), QStringLiteral("y"), &raw, &error, aimSize())) {
+            failTool(call, error);
+            return;
+        }
+        const QPoint pos = toScreen(raw);
         const int clicks = clampInt(args.value(QStringLiteral("clicks")).toDouble(1), 1, 3, 1);
 
         view->aiMouseMove(pos);
@@ -753,8 +860,16 @@ void AiConversation::runTool(const PendingTool &pending)
             return;
         }
 
-        const QPoint from = toScreen(QPoint{int(args.value(QStringLiteral("from_x")).toDouble()), int(args.value(QStringLiteral("from_y")).toDouble())});
-        const QPoint to = toScreen(QPoint{int(args.value(QStringLiteral("to_x")).toDouble()), int(args.value(QStringLiteral("to_y")).toDouble())});
+        QPoint rawFrom;
+        QPoint rawTo;
+        QString error;
+        if (!pointArg(args, QStringLiteral("from_x"), QStringLiteral("from_y"), &rawFrom, &error, aimSize())
+            || !pointArg(args, QStringLiteral("to_x"), QStringLiteral("to_y"), &rawTo, &error, aimSize())) {
+            failTool(call, error);
+            return;
+        }
+        const QPoint from = toScreen(rawFrom);
+        const QPoint to = toScreen(rawTo);
 
         // Intermediate moves so the remote drags (text selection, window
         // moves) track the pointer instead of teleporting.
@@ -771,7 +886,13 @@ void AiConversation::runTool(const PendingTool &pending)
     }
 
     if (name == QLatin1String("mouse_scroll")) {
-        const QPoint pos = toScreen(QPoint{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())});
+        QPoint raw;
+        QString error;
+        if (!pointArg(args, QStringLiteral("x"), QStringLiteral("y"), &raw, &error, aimSize())) {
+            failTool(call, error);
+            return;
+        }
+        const QPoint pos = toScreen(raw);
         const QString direction = args.value(QStringLiteral("direction")).toString().toLower();
         const int notches = clampInt(args.value(QStringLiteral("notches")).toDouble(1), 1, 20, 1);
 

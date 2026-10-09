@@ -108,6 +108,10 @@ public:
     /** @return the size of the remote screen, or an invalid size. */
     QSize screenSize() const;
 
+    /** @return the size coordinates are quoted in: the last screenshot sent
+     * to the model, or the screen before any screenshot has been sent. */
+    QSize aimSize() const;
+
     /**
      * Maps a position the model read off the last screenshot it received
      * to remote screen pixels. Screenshots are downscaled, so a coordinate
