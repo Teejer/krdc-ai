@@ -6,6 +6,8 @@
 
 #include "aitools.h"
 
+#include "aikeys.h"
+
 #include <QRegularExpression>
 #include <QJsonValue>
 
@@ -113,14 +115,43 @@ const QList<DangerousChord> &dangerousChords()
 
 QStringList normalizedChord(const QString &key, const QJsonArray &modifiers)
 {
-    QStringList chord;
+    QStringList chord = AiKeys::splitChord(key);
     for (const QJsonValue &value : modifiers) {
         chord.append(value.toString().toLower());
     }
-    chord.append(key.toLower());
     chord.removeAll(QString());
     chord.sort();
     return chord;
+}
+
+// The hotkey tool's "keys" argument: normally one string like "ctrl+a";
+// models that do send the old array form are accepted too.
+QStringList hotkeyChord(const QJsonObject &arguments)
+{
+    const QJsonValue value = arguments.value(QStringLiteral("keys"));
+    QStringList names;
+    if (value.isArray()) {
+        for (const QJsonValue &entry : value.toArray()) {
+            names.append(AiKeys::splitChord(entry.toString()));
+        }
+    } else {
+        names = AiKeys::splitChord(value.toString());
+    }
+    names.removeAll(QString());
+    names.sort();
+    return names;
+}
+
+bool isDangerousChord(const QStringList &sortedChord)
+{
+    for (const DangerousChord &dangerous : dangerousChords()) {
+        QStringList expected = dangerous.keys;
+        expected.sort();
+        if (expected == sortedChord) {
+            return true;
+        }
+    }
+    return false;
 }
 
 QString modifierList(const QJsonArray &modifiers)
@@ -130,6 +161,24 @@ QString modifierList(const QJsonArray &modifiers)
         names.append(value.toString());
     }
     return names.join(QLatin1Char('+'));
+}
+
+// An array property must declare its element schema; servers that validate
+// arguments reject or drop bare arrays, which is why press_key's modifiers
+// never arrived and the model fell back to one keystroke at a time.
+QJsonObject arrayProperty(const QString &description, const QJsonArray &allowed)
+{
+    QJsonObject items;
+    items.insert(QStringLiteral("type"), QStringLiteral("string"));
+    if (!allowed.isEmpty()) {
+        items.insert(QStringLiteral("enum"), allowed);
+    }
+
+    QJsonObject object;
+    object.insert(QStringLiteral("type"), QStringLiteral("array"));
+    object.insert(QStringLiteral("description"), description);
+    object.insert(QStringLiteral("items"), items);
+    return object;
 }
 
 QString truncated(const QString &text, int limit = 70)
@@ -236,11 +285,30 @@ QJsonArray AiTools::schemas()
                      QStringLiteral("Key to press, e.g. return, tab, escape, backspace, delete, space, up, down, left, right, "
                                     "home, end, pageup, pagedown, printscreen, f1…f12, win, menu, or a single character.")));
         properties.insert(QStringLiteral("modifiers"),
-                          property(QStringLiteral("array"),
-                                   QStringLiteral("Modifiers held while pressing the key: control, alt, shift, meta."),
-                                   QJsonArray{QStringLiteral("control"), QStringLiteral("alt"), QStringLiteral("shift"), QStringLiteral("meta")}));
-        tools.append(wrapped(QStringLiteral("press_key"), QStringLiteral("Press a key or a key combination on the remote machine."), properties,
+                          arrayProperty(QStringLiteral("Modifiers held while pressing the key: control, alt, shift, meta."),
+                                        QJsonArray{QStringLiteral("control"), QStringLiteral("alt"), QStringLiteral("shift"),
+                                                   QStringLiteral("meta")}));
+        tools.append(wrapped(QStringLiteral("press_key"),
+                             QStringLiteral("Press a single key, optionally with modifiers held. For a keyboard shortcut such as "
+                                            "Ctrl+A or Alt+Tab, prefer the hotkey tool."),
+                             properties,
                              {QStringLiteral("key")}));
+    }
+
+    {
+        QJsonObject properties;
+        properties.insert(
+            QStringLiteral("keys"),
+            property(QStringLiteral("string"),
+                     QStringLiteral("The combination as one string, keys joined with \"+\", modifiers first and the final key "
+                                    "last: \"ctrl+a\", \"win+d\", \"alt+tab\", \"ctrl+shift+esc\". Modifier names: ctrl, alt, "
+                                    "shift, win.")));
+        tools.append(wrapped(QStringLiteral("hotkey"),
+                             QStringLiteral("Press a keyboard shortcut on the remote machine, e.g. ctrl+a to select all. All "
+                                            "keys in the string are held down together, exactly as if you pressed the "
+                                            "combination on the keyboard yourself."),
+                             properties,
+                             {QStringLiteral("keys")}));
     }
 
     {
@@ -262,7 +330,8 @@ bool AiTools::isKnownTool(const QString &name)
     static const QStringList names = {
         QStringLiteral("take_screenshot"), QStringLiteral("screen_info"),      QStringLiteral("mouse_move"),
         QStringLiteral("mouse_click"),     QStringLiteral("mouse_drag"),       QStringLiteral("mouse_scroll"),
-        QStringLiteral("type_text"),       QStringLiteral("press_key"),        QStringLiteral("wait"),
+        QStringLiteral("type_text"),       QStringLiteral("press_key"),        QStringLiteral("hotkey"),
+        QStringLiteral("wait"),
     };
     return names.contains(name);
 }
@@ -285,16 +354,14 @@ AiTools::Risk AiTools::risk(const QString &name, const QJsonObject &arguments)
     }
 
     if (name == QLatin1String("press_key")) {
-        const QStringList chord =
-            normalizedChord(arguments.value(QStringLiteral("key")).toString(), arguments.value(QStringLiteral("modifiers")).toArray());
-        for (const DangerousChord &dangerous : dangerousChords()) {
-            QStringList expected = dangerous.keys;
-            expected.sort();
-            if (expected == chord) {
-                return Risk::Dangerous;
-            }
-        }
-        return Risk::Action;
+        return isDangerousChord(
+            normalizedChord(arguments.value(QStringLiteral("key")).toString(), arguments.value(QStringLiteral("modifiers")).toArray()))
+            ? Risk::Dangerous
+            : Risk::Action;
+    }
+
+    if (name == QLatin1String("hotkey")) {
+        return isDangerousChord(hotkeyChord(arguments)) ? Risk::Dangerous : Risk::Action;
     }
 
     return Risk::Action;
@@ -341,6 +408,15 @@ QString AiTools::describe(const QString &name, const QJsonObject &arguments)
         }
         return QStringLiteral("Press %1+%2").arg(modifiers, key);
     }
+    if (name == QLatin1String("hotkey")) {
+        QStringList chord = hotkeyChord(arguments);
+        // Show the natural reading order (ctrl+a), not the sorted match form.
+        const QJsonValue keys = arguments.value(QStringLiteral("keys"));
+        if (keys.isString()) {
+            return QStringLiteral("Press %1").arg(keys.toString());
+        }
+        return QStringLiteral("Press %1").arg(chord.join(QLatin1Char('+')));
+    }
     if (name == QLatin1String("wait")) {
         return QStringLiteral("Wait %1 s").arg(arguments.value(QStringLiteral("seconds")).toDouble());
     }
@@ -364,6 +440,17 @@ QString AiTools::dangerReason(const QString &name, const QJsonObject &arguments)
     if (name == QLatin1String("press_key")) {
         const QStringList chord =
             normalizedChord(arguments.value(QStringLiteral("key")).toString(), arguments.value(QStringLiteral("modifiers")).toArray());
+        for (const DangerousChord &dangerous : dangerousChords()) {
+            QStringList expected = dangerous.keys;
+            expected.sort();
+            if (expected == chord) {
+                return QString::fromLatin1(dangerous.reason) + QStringLiteral(".");
+            }
+        }
+    }
+
+    if (name == QLatin1String("hotkey")) {
+        const QStringList chord = hotkeyChord(arguments);
         for (const DangerousChord &dangerous : dangerousChords()) {
             QStringList expected = dangerous.keys;
             expected.sort();

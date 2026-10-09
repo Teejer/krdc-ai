@@ -12,6 +12,12 @@
 int AiKeys::qtKey(const QString &name)
 {
     static const QHash<QString, int> table = {
+        {QStringLiteral("ctrl"), Qt::Key_Control},
+        {QStringLiteral("control"), Qt::Key_Control},
+        {QStringLiteral("shift"), Qt::Key_Shift},
+        {QStringLiteral("alt"), Qt::Key_Alt},
+        {QStringLiteral("option"), Qt::Key_Alt},
+        {QStringLiteral("opt"), Qt::Key_Alt},
         {QStringLiteral("return"), Qt::Key_Return},
         {QStringLiteral("enter"), Qt::Key_Return},
         {QStringLiteral("numpadenter"), Qt::Key_Enter},
@@ -45,6 +51,8 @@ int AiKeys::qtKey(const QString &name)
         {QStringLiteral("menu"), Qt::Key_Menu},
         {QStringLiteral("contextmenu"), Qt::Key_Menu},
         {QStringLiteral("win"), Qt::Key_Super_L},
+        {QStringLiteral("lwin"), Qt::Key_Super_L},
+        {QStringLiteral("rwin"), Qt::Key_Super_R},
         {QStringLiteral("super"), Qt::Key_Super_L},
         {QStringLiteral("meta"), Qt::Key_Super_L},
         {QStringLiteral("cmd"), Qt::Key_Super_L},
@@ -106,4 +114,14 @@ Qt::KeyboardModifiers AiKeys::modifiers(const QStringList &names, QStringList &u
     }
 
     return modifiers;
+}
+
+QStringList AiKeys::splitChord(const QString &chord)
+{
+    QStringList names = chord.toLower().split(QLatin1Char('+'), Qt::SkipEmptyParts);
+    for (QString &name : names) {
+        name = name.trimmed();
+    }
+    names.removeAll(QString());
+    return names;
 }

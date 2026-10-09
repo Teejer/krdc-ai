@@ -665,30 +665,44 @@ void AiConversation::runTool(const PendingTool &pending)
     }
 
     if (name == QLatin1String("press_key")) {
-        const QStringList modifierNames = [&args] {
-            QStringList names;
-            for (const QJsonValue &value : args.value(QStringLiteral("modifiers")).toArray()) {
-                names.append(value.toString());
+        QStringList names;
+        for (const QJsonValue &value : args.value(QStringLiteral("modifiers")).toArray()) {
+            names.append(value.toString().trimmed().toLower());
+        }
+        // Models that cannot emit the modifiers array often write the whole
+        // combination into key instead: "ctrl+a". Accept both spellings.
+        names.append(AiKeys::splitChord(args.value(QStringLiteral("key")).toString()));
+        names.removeAll(QString());
+
+        QString error;
+        if (!sendChord(view, names, &error)) {
+            failTool(call, error);
+            return;
+        }
+        finishTool(call, QStringLiteral("Pressed %1.").arg(names.join(QLatin1Char('+'))));
+        return;
+    }
+
+    if (name == QLatin1String("hotkey")) {
+        // Normally one string like "ctrl+a"; the old array form is accepted
+        // too so an in-flight conversation never breaks on the schema change.
+        const QJsonValue keys = args.value(QStringLiteral("keys"));
+        QStringList names;
+        if (keys.isArray()) {
+            for (const QJsonValue &entry : keys.toArray()) {
+                names.append(AiKeys::splitChord(entry.toString()));
             }
-            return names;
-        }();
+        } else {
+            names = AiKeys::splitChord(keys.toString());
+        }
+        names.removeAll(QString());
 
-        QStringList unknownModifiers;
-        const Qt::KeyboardModifiers modifiers = AiKeys::modifiers(modifierNames, unknownModifiers);
-        if (!unknownModifiers.isEmpty()) {
-            failTool(call, QStringLiteral("Unknown modifier key(s): %1.").arg(unknownModifiers.join(QStringLiteral(", "))));
+        QString error;
+        if (!sendChord(view, names, &error)) {
+            failTool(call, error);
             return;
         }
-
-        const int key = AiKeys::qtKey(args.value(QStringLiteral("key")).toString());
-        if (key == 0) {
-            failTool(call, QStringLiteral("Unknown key “%1”.").arg(args.value(QStringLiteral("key")).toString()));
-            return;
-        }
-
-        view->aiKeyPress(key, modifiers, true);
-        view->aiKeyPress(key, modifiers, false);
-        finishTool(call, QStringLiteral("Key pressed."));
+        finishTool(call, QStringLiteral("Pressed %1.").arg(names.join(QLatin1Char('+'))));
         return;
     }
 
@@ -738,6 +752,63 @@ void AiConversation::typeNextChunk()
     } else {
         QTimer::singleShot(m_typeDelay, this, &AiConversation::typeNextChunk);
     }
+}
+
+bool AiConversation::sendChord(RemoteView *view, const QStringList &names, QString *error)
+{
+    if (names.isEmpty() || names.size() > 8) {
+        *error = QStringLiteral("The key combination must hold between 1 and 8 keys.");
+        return false;
+    }
+
+    QVector<int> keys;
+    keys.reserve(names.size());
+    for (const QString &name : names) {
+        if (name == QLatin1String("backtab")) {
+            // Reverse tab is Shift+Tab: Qt has no separate key for it and the
+            // wire only knows Tab with Shift held.
+            if (!keys.contains(AiKeys::qtKey(QStringLiteral("shift")))) {
+                keys.append(AiKeys::qtKey(QStringLiteral("shift")));
+            }
+            keys.append(AiKeys::qtKey(QStringLiteral("tab")));
+            continue;
+        }
+        const int key = AiKeys::qtKey(name);
+        if (key == 0) {
+            *error = QStringLiteral("Unknown key “%1”. Use names like ctrl, alt, shift, win, return, tab, f5, or a single "
+                                    "character; join combination keys with “+”, modifiers first.")
+                         .arg(name);
+            return false;
+        }
+        keys.append(key);
+    }
+
+    // Everything but the last key is held down; the last key is tapped. Each
+    // key is pressed by its own name (no Qt modifier flags) so the down and
+    // up of each key pair up exactly, even when the tapped key is itself a
+    // modifier, e.g. ctrl+shift+tab.
+    qCDebug(KRDC) << "AI chord down:" << names.join(QLatin1Char('+'));
+    for (int i = 0; i + 1 < keys.size(); ++i) {
+        view->aiKeyPress(keys.at(i), Qt::NoModifier, true);
+    }
+    view->aiKeyPress(keys.last(), Qt::NoModifier, true);
+
+    // The final key is released immediately; the held keys are released on a
+    // short stagger. A down and its up in the same millisecond are dropped by
+    // some remote applications.
+    constexpr int StepMs = 15;
+    view->aiKeyPress(keys.last(), Qt::NoModifier, false);
+    for (int i = keys.size() - 2; i >= 0; --i) {
+        const int key = keys.at(i);
+        // Release through m_view (a QPointer): if the tab closes before the
+        // timer fires, the release is skipped instead of dangling.
+        QTimer::singleShot((keys.size() - 1 - i) * StepMs, this, [this, key] {
+            if (m_view) {
+                m_view->aiKeyPress(key, Qt::NoModifier, false);
+            }
+        });
+    }
+    return true;
 }
 
 QString AiConversation::historyFilePath() const

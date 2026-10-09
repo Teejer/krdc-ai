@@ -118,6 +118,13 @@ private:
     void runTool(const PendingTool &pending);
     void finishTool(const AiToolCall &call, const QString &result, const QByteArray &image = QByteArray());
     void failTool(const AiToolCall &call, const QString &message);
+
+    /**
+     * Holds every name but the last down, taps the last one, then releases
+     * the held keys on a short stagger. @p names is the combination in order,
+     * modifiers first ("ctrl", "a"). Used by both press_key and hotkey.
+     */
+    bool sendChord(RemoteView *view, const QStringList &names, QString *error);
     void setBusy(bool busy);
 
     int startTyping(const AiToolCall &call, const QString &text, int delayMs);
