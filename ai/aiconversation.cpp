@@ -249,7 +249,7 @@ void AiConversation::clear()
     Q_EMIT entriesChanged();
 }
 
-QByteArray AiConversation::grabScreenshot() const
+QByteArray AiConversation::grabScreenshot()
 {
     if (!m_view || m_view->status() != RemoteView::Connected) {
         return {};
@@ -271,7 +271,24 @@ QByteArray AiConversation::grabScreenshot() const
     if (!pixmap.save(&buffer, "JPEG", std::clamp(m_config.imageQuality, 10, 100))) {
         return {};
     }
+    m_sentImageSize = pixmap.size();
     return bytes;
+}
+
+QPoint AiConversation::toScreen(const QPoint &pos) const
+{
+    const QSize screen = screenSize();
+    if (screen.isEmpty() || !m_sentImageSize.isValid() || m_sentImageSize.isEmpty()
+        || m_sentImageSize == screen) {
+        return pos;
+    }
+
+    // Integer math with rounding half a pixel either way is far below the
+    // size of a button; the model's own reading of the image is the coarse
+    // step here, not this conversion.
+    const int x = qRound(qreal(pos.x()) * screen.width() / m_sentImageSize.width());
+    const int y = qRound(qreal(pos.y()) * screen.height() / m_sentImageSize.height());
+    return QPoint{std::clamp(x, 0, screen.width() - 1), std::clamp(y, 0, screen.height() - 1)};
 }
 
 QSize AiConversation::screenSize() const
@@ -541,7 +558,13 @@ void AiConversation::runTool(const PendingTool &pending)
         if (image.isEmpty()) {
             failTool(call, QStringLiteral("No screenshot available. Is the connection established?"));
         } else {
-            finishTool(call, QStringLiteral("Screenshot attached. Remote screen is %1x%2 pixels.").arg(screenSize().width()).arg(screenSize().height()),
+            finishTool(call,
+                       QStringLiteral("Screenshot attached; this image is %1x%2 pixels, the screen is %3x%4 pixels. "
+                                      "Point tools take coordinates in this image's pixels.")
+                           .arg(m_sentImageSize.width())
+                           .arg(m_sentImageSize.height())
+                           .arg(screenSize().width())
+                           .arg(screenSize().height()),
                        image);
         }
         return;
@@ -607,6 +630,8 @@ void AiConversation::runTool(const PendingTool &pending)
         result.insert(QStringLiteral("url"), view ? view->url().toString() : QString());
         result.insert(QStringLiteral("screen_width"), size.width());
         result.insert(QStringLiteral("screen_height"), size.height());
+        result.insert(QStringLiteral("screenshot_width"), m_sentImageSize.width());
+        result.insert(QStringLiteral("screenshot_height"), m_sentImageSize.height());
         result.insert(QStringLiteral("connected"), view && view->status() == RemoteView::Connected);
         result.insert(QStringLiteral("input_ready"), view && view->supportsAiControl());
         finishTool(call, QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
@@ -619,7 +644,7 @@ void AiConversation::runTool(const PendingTool &pending)
     }
 
     if (name == QLatin1String("mouse_move")) {
-        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
+        const QPoint pos = toScreen(QPoint{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())});
         view->aiMouseMove(pos);
         finishTool(call, QStringLiteral("Pointer moved to (%1, %2).").arg(pos.x()).arg(pos.y()));
         return;
@@ -633,7 +658,7 @@ void AiConversation::runTool(const PendingTool &pending)
             return;
         }
 
-        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
+        const QPoint pos = toScreen(QPoint{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())});
         const int clicks = clampInt(args.value(QStringLiteral("clicks")).toDouble(1), 1, 3, 1);
 
         view->aiMouseMove(pos);
@@ -653,8 +678,8 @@ void AiConversation::runTool(const PendingTool &pending)
             return;
         }
 
-        const QPoint from{int(args.value(QStringLiteral("from_x")).toDouble()), int(args.value(QStringLiteral("from_y")).toDouble())};
-        const QPoint to{int(args.value(QStringLiteral("to_x")).toDouble()), int(args.value(QStringLiteral("to_y")).toDouble())};
+        const QPoint from = toScreen(QPoint{int(args.value(QStringLiteral("from_x")).toDouble()), int(args.value(QStringLiteral("from_y")).toDouble())});
+        const QPoint to = toScreen(QPoint{int(args.value(QStringLiteral("to_x")).toDouble()), int(args.value(QStringLiteral("to_y")).toDouble())});
 
         // Intermediate moves so the remote drags (text selection, window
         // moves) track the pointer instead of teleporting.
@@ -671,7 +696,7 @@ void AiConversation::runTool(const PendingTool &pending)
     }
 
     if (name == QLatin1String("mouse_scroll")) {
-        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
+        const QPoint pos = toScreen(QPoint{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())});
         const QString direction = args.value(QStringLiteral("direction")).toString().toLower();
         const int notches = clampInt(args.value(QStringLiteral("notches")).toDouble(1), 1, 20, 1);
 
