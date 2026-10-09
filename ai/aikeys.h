@@ -27,4 +27,15 @@ int qtKey(const QString &name);
  * @return the matching Qt modifier mask
  */
 Qt::KeyboardModifiers modifiers(const QStringList &names, QStringList &unknown);
+
+/**
+ * Splits a chord written as one string, e.g. "ctrl+a" or "ctrl+shift+esc",
+ * into its key names. Models that cannot emit array arguments reliably send
+ * combinations this way even where a list was asked for, so both key tools
+ * accept it.
+ *
+ * @return the names, lower-case and empty parts removed; empty when the
+ * string holds no usable name
+ */
+QStringList splitChord(const QString &chord);
 }
