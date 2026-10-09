@@ -36,8 +36,13 @@ struct AiConfig {
     int imageMaxSize = 1280;
     int imageQuality = 80;
 
+    /** Folder the save_screenshot tool writes files into. */
+    QString screenshotPath = defaultScreenshotPath();
+
     /** Seconds to wait for a response before giving up. */
     int timeoutSeconds = 120;
+
+    static QString defaultScreenshotPath();
 
     static AiConfig load();
     void save() const;

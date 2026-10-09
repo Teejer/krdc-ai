@@ -10,6 +10,17 @@
 #include <KSharedConfig>
 
 #include <QChar>
+#include <QDir>
+#include <QStandardPaths>
+
+QString AiConfig::defaultScreenshotPath()
+{
+    QString pictures = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    if (pictures.isEmpty()) {
+        pictures = QDir::homePath();
+    }
+    return pictures + QStringLiteral("/krdc-ai");
+}
 
 AiConfig AiConfig::load()
 {
@@ -28,6 +39,7 @@ AiConfig AiConfig::load()
     config.imageMaxSize = group.readEntry(QStringLiteral("ImageMaxSize"), config.imageMaxSize);
     config.imageQuality = group.readEntry(QStringLiteral("ImageQuality"), config.imageQuality);
     config.timeoutSeconds = group.readEntry(QStringLiteral("TimeoutSeconds"), config.timeoutSeconds);
+    config.screenshotPath = group.readEntry(QStringLiteral("ScreenshotPath"), AiConfig{}.screenshotPath);
 
     return config;
 }
@@ -48,6 +60,7 @@ void AiConfig::save() const
     group.writeEntry(QStringLiteral("ImageMaxSize"), imageMaxSize);
     group.writeEntry(QStringLiteral("ImageQuality"), imageQuality);
     group.writeEntry(QStringLiteral("TimeoutSeconds"), timeoutSeconds);
+    group.writeEntry(QStringLiteral("ScreenshotPath"), screenshotPath);
 
     group.config()->sync();
 }
@@ -94,6 +107,8 @@ QString AiConfig::defaultSystemPrompt()
         "- For keyboard shortcuts always use the hotkey tool with the combination as one string, modifiers first: \"ctrl+a\", "
         "\"win+e\", \"alt+tab\", \"ctrl+shift+esc\". Never press the modifier and the key separately, never type a shortcut "
         "with type_text. Use press_key only for single keys like return, escape or tab.\n"
+        "- When writing a guide or documenting a procedure, capture each key step with save_screenshot using short "
+        "descriptive file names, then quote the paths it returns in the write-up.\n"
         "- Never guess a coordinate you cannot see; take a screenshot first.\n"
         "- If an action needs a password or would delete or overwrite something, stop and let "
         "the user do it or confirm it.\n"
