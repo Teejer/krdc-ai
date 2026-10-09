@@ -63,6 +63,13 @@ void AiPanel::registerAction(KActionCollection *collection)
     QAction *action = collection->addAction(QStringLiteral("ai_assistant"), m_dock->toggleViewAction());
     action->setText(i18n("AI Assistant"));
     action->setIcon(QIcon::fromTheme(QStringLiteral("system-run")));
+    // A shortcut is the only reliable way to reach the panel while a session
+    // has the keyboard: the menu-bar toggle (Ctrl+M) is swallowed by the
+    // remote view's key handling, and the dock itself has no other control
+    // once hidden. WindowShortcut is matched before the remote view sees the
+    // key, so it works even while connected.
+    collection->setDefaultShortcut(action, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_A));
+    action->setToolTip(i18n("Show or hide the AI Assistant panel (Ctrl+Shift+A)"));
 }
 
 AiConversationPage *AiPanel::pageFor(RemoteView *view, const QString &title)
