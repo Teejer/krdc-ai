@@ -42,10 +42,10 @@ QHash<int, DWORD> qtKeyTable()
         {Qt::Key_Down, VK_DOWN},
         {Qt::Key_PageUp, VK_PRIOR},
         {Qt::Key_PageDown, VK_NEXT},
-        {Qt::Key_Shift, VK_SHIFT},
-        {Qt::Key_Control, VK_CONTROL},
+        {Qt::Key_Shift, VK_LSHIFT},
+        {Qt::Key_Control, VK_LCONTROL},
         {Qt::Key_Meta, VK_LWIN},
-        {Qt::Key_Alt, VK_MENU},
+        {Qt::Key_Alt, VK_LMENU},
         {Qt::Key_AltGr, VK_RMENU},
         {Qt::Key_CapsLock, VK_CAPITAL},
         {Qt::Key_NumLock, VK_NUMLOCK},
@@ -176,16 +176,22 @@ DWORD RdpAiInput::virtualKeyForChar(QChar ch, Qt::KeyboardModifiers &modifiers)
 
 QVector<DWORD> RdpAiInput::modifierVirtualKeys(Qt::KeyboardModifiers modifiers)
 {
+    // Left-side specific virtual keys, not the generic VK_SHIFT/VK_CONTROL/
+    // VK_MENU aliases: winpr's virtual-key-to-scancode tables (and the RDP
+    // protocol itself) only know the specific keys, so the generic codes
+    // convert to scancode 0 and every injected combination loses its
+    // modifiers. Injecting the specific key is also what a physical
+    // left-hand keyboard press produces, which the manual input path shows.
     QVector<DWORD> keys;
 
     if (modifiers & Qt::ShiftModifier) {
-        keys.append(VK_SHIFT);
+        keys.append(VK_LSHIFT);
     }
     if (modifiers & Qt::ControlModifier) {
-        keys.append(VK_CONTROL);
+        keys.append(VK_LCONTROL);
     }
     if (modifiers & Qt::AltModifier) {
-        keys.append(VK_MENU);
+        keys.append(VK_LMENU);
     }
     if (modifiers & Qt::MetaModifier) {
         keys.append(VK_LWIN);

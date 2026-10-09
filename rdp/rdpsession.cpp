@@ -1687,20 +1687,121 @@ bool RdpSession::aiSendPointerWheel(const QPoint &pos, const QPoint &angleDelta)
     return freerdp_input_send_mouse_event(m_context.rdp->input, flags, uint16_t(remote.x()), uint16_t(remote.y()));
 }
 
+// Enhanced keys of a 101-key keyboard (MS-RDPBCGR 2.2.8.1.1.3.1.1.1). The
+// winpr virtual-key-to-scancode tables list these under an extended table
+// that is only consulted when the virtual key carries the KBDEXT tag, and
+// the manual input path receives that tag from the XKB key tables. Without
+// it, winpr searches the plain table, finds e.g. VK_DECIMAL instead of
+// VK_DELETE at 0x53, and converts to scancode 0.
+static DWORD extendedVirtualKey(DWORD virtualKey)
+{
+    switch (virtualKey) {
+    case VK_RETURN: // main Enter is extended; numpad Enter is a multivk
+    case VK_RCONTROL:
+    case VK_RMENU:
+    case VK_SNAPSHOT:
+    case VK_DIVIDE:
+    case VK_VOLUME_MUTE:
+    case VK_VOLUME_DOWN:
+    case VK_VOLUME_UP:
+    case VK_MEDIA_NEXT_TRACK:
+    case VK_MEDIA_PREV_TRACK:
+    case VK_MEDIA_PLAY_PAUSE:
+    case VK_MEDIA_STOP:
+    case VK_BROWSER_HOME:
+    case VK_BROWSER_SEARCH:
+    case VK_BROWSER_FAVORITES:
+    case VK_BROWSER_REFRESH:
+    case VK_BROWSER_STOP:
+    case VK_BROWSER_FORWARD:
+    case VK_BROWSER_BACK:
+    case VK_HOME:
+    case VK_UP:
+    case VK_PRIOR:
+    case VK_LEFT:
+    case VK_RIGHT:
+    case VK_END:
+    case VK_DOWN:
+    case VK_NEXT:
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_APPS:
+        return virtualKey | KBDEXT;
+    default:
+        return virtualKey;
+    }
+}
+
 bool RdpSession::aiSendVirtualKey(DWORD virtualKey, bool pressed)
 {
     if (!aiInputReady() || virtualKey == 0) {
+        qCWarning(KRDC) << "AI key refused: input ready =" << aiInputReady() << "virtual key =" << virtualKey;
         return false;
+    }
+
+    // Log the keyboard-type setting once per process: every virtual key is
+    // turned into an RDP scancode through it, so a wrong value here breaks
+    // all injected keys while typed text still works via the Unicode channel.
+    static bool loggedKeyboardType = false;
+    if (!loggedKeyboardType) {
+        loggedKeyboardType = true;
+        qCWarning(KRDC) << "AI input: FreeRDP_KeyboardType ="
+                        << freerdp_settings_get_uint32(m_context.rdp->settings, FreeRDP_KeyboardType);
+    }
+
+    // The Windows keys need the EXTENDED1 flag (MS-RDPBCGR 2.2.8.1.1.3.1.1.1).
+    // The virtual-key-to-scancode conversion only ever yields the plain
+    // EXTENDED flag, and the server silently drops a 0x5B/0x5C that arrives
+    // without extended1.
+    if (virtualKey == VK_LWIN || virtualKey == VK_RWIN) {
+        UINT16 flags = KBD_FLAGS_EXTENDED1;
+        if (!pressed) {
+            flags |= KBD_FLAGS_RELEASE;
+        }
+        const UINT16 code = (virtualKey == VK_LWIN) ? 0x5B : 0x5C;
+        const bool sent = freerdp_input_send_keyboard_event(m_context.rdp->input, flags, uint8_t(code));
+        qCDebug(KRDC) << "AI key" << virtualKey << (pressed ? "down" : "up") << "scancode" << code << "extended1"
+                      << "sent =" << sent;
+        return sent;
+    }
+
+    // Pause is not one scancode: a physical press is the sequence
+    // E1 1D 45 E1 9D C5 (left Ctrl + NumLock) and has no separate release.
+    if (virtualKey == VK_PAUSE) {
+        if (!pressed) {
+            return true;
+        }
+        auto *input = m_context.rdp->input;
+        bool ok = freerdp_input_send_keyboard_event(input, KBD_FLAGS_EXTENDED1, 0x1D);
+        ok = freerdp_input_send_keyboard_event(input, 0, 0x45) && ok;
+        ok = freerdp_input_send_keyboard_event(input, KBD_FLAGS_EXTENDED1 | KBD_FLAGS_RELEASE, 0x1D) && ok;
+        ok = freerdp_input_send_keyboard_event(input, KBD_FLAGS_RELEASE, 0x45) && ok;
+        qCDebug(KRDC) << "AI key" << virtualKey << "pause sequence sent =" << ok;
+        return ok;
+    }
+
+    // NumLock: winpr's table lists it unextended, but a physical press is
+    // E0 45; tagging it KBDEXT finds no table entry, so send it directly.
+    if (virtualKey == VK_NUMLOCK) {
+        UINT16 flags = KBD_FLAGS_EXTENDED;
+        if (!pressed) {
+            flags |= KBD_FLAGS_RELEASE;
+        }
+        const bool sent = freerdp_input_send_keyboard_event(m_context.rdp->input, flags, 0x45);
+        qCDebug(KRDC) << "AI key" << virtualKey << (pressed ? "down" : "up") << "scancode 69 extended sent =" << sent;
+        return sent;
     }
 
     const auto keyboardType = freerdp_settings_get_uint32(m_context.rdp->settings, FreeRDP_KeyboardType);
-    const DWORD code = GetVirtualScanCodeFromVirtualKeyCode(virtualKey, keyboardType);
+    const DWORD code = GetVirtualScanCodeFromVirtualKeyCode(extendedVirtualKey(virtualKey), keyboardType);
     if (code == 0) {
-        qCWarning(KRDC) << "No scancode for virtual key" << virtualKey;
+        qCWarning(KRDC) << "No scancode for virtual key" << virtualKey << "keyboard type" << keyboardType;
         return false;
     }
 
-    return freerdp_input_send_keyboard_event_ex(m_context.rdp->input, pressed ? TRUE : FALSE, FALSE, code);
+    const bool sent = freerdp_input_send_keyboard_event_ex(m_context.rdp->input, pressed ? TRUE : FALSE, FALSE, code);
+    qCDebug(KRDC) << "AI key" << virtualKey << (pressed ? "down" : "up") << "scancode" << code << "sent =" << sent;
+    return sent;
 }
 
 bool RdpSession::aiSendUnicodeChar(QChar ch)
@@ -1730,12 +1831,12 @@ int RdpSession::aiTypeText(const QString &text)
         if (vk != 0) {
             const bool shift = modifiers.testFlag(Qt::ShiftModifier);
             if (shift) {
-                aiSendVirtualKey(VK_SHIFT, true);
+                aiSendVirtualKey(VK_LSHIFT, true);
             }
             const bool sent = aiSendVirtualKey(vk, true);
             aiSendVirtualKey(vk, false);
             if (shift) {
-                aiSendVirtualKey(VK_SHIFT, false);
+                aiSendVirtualKey(VK_LSHIFT, false);
             }
             if (sent) {
                 continue;
