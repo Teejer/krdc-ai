@@ -228,11 +228,12 @@ void AiConversationPage::reloadApprovalBar()
         if (preview.isNull()) {
             m_approvalPreview->setVisible(false);
         } else {
-            // Fit the crop to the panel width without upscaling tiny crops
-            // past their own size; the crosshair stays accurate either way.
-            const int widest = qMin(preview.width() * 2, 300);
+            // Show the crop no larger than it was captured: the panel shows
+            // the spot in context rather than a magnified close-up, which
+            // keeps the approval bar compact.
+            const int widest = qMin(preview.width(), 220);
             m_approvalPreview->setPixmap(
-                preview.scaled(widest, preview.height() * 2, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                preview.scaled(widest, 165, Qt::KeepAspectRatio, Qt::SmoothTransformation));
             m_approvalPreview->setVisible(true);
         }
     } else {
