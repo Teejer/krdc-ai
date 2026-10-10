@@ -56,10 +56,10 @@ index f99b39e2..6750798e 100644
      KF6::BookmarksWidgets
 diff --git a/ai/aiconfig.cpp b/ai/aiconfig.cpp
 new file mode 100644
-index 00000000..f3a50435
+index 00000000..ddb91146
 --- /dev/null
 +++ b/ai/aiconfig.cpp
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,130 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -72,6 +72,17 @@ index 00000000..f3a50435
 +#include <KSharedConfig>
 +
 +#include <QChar>
++#include <QDir>
++#include <QStandardPaths>
++
++QString AiConfig::defaultScreenshotPath()
++{
++    QString pictures = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
++    if (pictures.isEmpty()) {
++        pictures = QDir::homePath();
++    }
++    return pictures + QStringLiteral("/krdc-ai");
++}
 +
 +AiConfig AiConfig::load()
 +{
@@ -90,6 +101,7 @@ index 00000000..f3a50435
 +    config.imageMaxSize = group.readEntry(QStringLiteral("ImageMaxSize"), config.imageMaxSize);
 +    config.imageQuality = group.readEntry(QStringLiteral("ImageQuality"), config.imageQuality);
 +    config.timeoutSeconds = group.readEntry(QStringLiteral("TimeoutSeconds"), config.timeoutSeconds);
++    config.screenshotPath = group.readEntry(QStringLiteral("ScreenshotPath"), AiConfig{}.screenshotPath);
 +
 +    return config;
 +}
@@ -110,6 +122,7 @@ index 00000000..f3a50435
 +    group.writeEntry(QStringLiteral("ImageMaxSize"), imageMaxSize);
 +    group.writeEntry(QStringLiteral("ImageQuality"), imageQuality);
 +    group.writeEntry(QStringLiteral("TimeoutSeconds"), timeoutSeconds);
++    group.writeEntry(QStringLiteral("ScreenshotPath"), screenshotPath);
 +
 +    group.config()->sync();
 +}
@@ -142,7 +155,7 @@ index 00000000..f3a50435
 +
 +QString AiConfig::defaultSystemPrompt()
 +{
-+    return QStringLiteral(
++    QString prompt = QStringLiteral(
 +        "You are an assistant embedded in KRDC, a remote desktop client. You are looking at the "
 +        "screen of a remote machine that the user is connected to, usually over RDP.\n\n"
 +        "Rules:\n"
@@ -153,17 +166,36 @@ index 00000000..f3a50435
 +        "the coordinates you read off the image accordingly.\n"
 +        "- Prefer small, verifiable steps. Act, then take a screenshot to see what happened "
 +        "before acting again.\n"
++        "- For keyboard shortcuts always use the hotkey tool with the combination as one string, modifiers first: \"ctrl+a\", "
++        "\"win+e\", \"alt+tab\", \"ctrl+shift+esc\". Never press the modifier and the key separately, never type a shortcut "
++        "with type_text. Use press_key only for single keys like return, escape or tab.\n"
++        "- When writing a guide or documenting a procedure, capture each key step with save_screenshot using short "
++        "descriptive file names, then quote the paths it returns in the write-up.\n"
 +        "- Never guess a coordinate you cannot see; take a screenshot first.\n"
++        "- On every click or drag, set the target field to a few words naming what you are clicking, e.g. \"the OK button\"; "
++        "the user approves the action from that and a zoomed crop of the spot.\n"
 +        "- If an action needs a password or would delete or overwrite something, stop and let "
 +        "the user do it or confirm it.\n"
 +        "- Keep answers short. Report what you did and what the screen now shows.");
++    if (prompt.contains(QLatin1String("If the reported image size differs"))) {
++        // The old wording made the model rescale coordinates itself, and
++        // models are bad at that arithmetic: clicks landed off target by the
++        // downscale factor. The point tools map screenshot pixels to screen
++        // pixels now, so the model must not.
++        return prompt.replace(
++            QLatin1String("If the reported image size differs from the screen size, scale the coordinates you read off the "
++                          "image accordingly."),
++            QStringLiteral("Point tools take coordinates in this image's pixels and are mapped to the real screen "
++                           "for you; do not scale coordinates yourself."));
++    }
++    return prompt;
 +}
 diff --git a/ai/aiconfig.h b/ai/aiconfig.h
 new file mode 100644
-index 00000000..e2d2dff0
+index 00000000..09f2fe6d
 --- /dev/null
 +++ b/ai/aiconfig.h
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,61 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -202,8 +234,13 @@ index 00000000..e2d2dff0
 +    int imageMaxSize = 1280;
 +    int imageQuality = 80;
 +
++    /** Folder the save_screenshot tool writes files into. */
++    QString screenshotPath = defaultScreenshotPath();
++
 +    /** Seconds to wait for a response before giving up. */
 +    int timeoutSeconds = 120;
++
++    static QString defaultScreenshotPath();
 +
 +    static AiConfig load();
 +    void save() const;
@@ -222,10 +259,10 @@ index 00000000..e2d2dff0
 +};
 diff --git a/ai/aiconversation.cpp b/ai/aiconversation.cpp
 new file mode 100644
-index 00000000..cfed010d
+index 00000000..c770505e
 --- /dev/null
 +++ b/ai/aiconversation.cpp
-@@ -0,0 +1,851 @@
+@@ -0,0 +1,1198 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -241,6 +278,7 @@ index 00000000..cfed010d
 +
 +#include <QBuffer>
 +#include <QCryptographicHash>
++#include <QDateTime>
 +#include <QDir>
 +#include <QFile>
 +#include <QFileInfo>
@@ -248,6 +286,9 @@ index 00000000..cfed010d
 +#include <QJsonDocument>
 +#include <QJsonParseError>
 +#include <QJsonObject>
++#include <QPainter>
++#include <QPixmap>
++#include <QRegularExpression>
 +#include <QStandardPaths>
 +#include <QTimer>
 +
@@ -271,6 +312,68 @@ index 00000000..cfed010d
 +        return fallback;
 +    }
 +    return std::clamp(int(value), minimum, maximum);
++}
++
++// Reads one coordinate the model claims is a number. Models that have not
++// looked at the screen send placeholders instead: measured in the wild, this
++// model answers "[redacted]" rather than invent a number it cannot see, and
++// QJsonValue::toDouble() turns that into 0.0, which used to land the click in
++// the top-left corner with a confident "Clicked at (0, 0)" afterwards.
++bool numberArg(const QJsonObject &args, const QString &name, int *value)
++{
++    const QJsonValue entry = args.value(name);
++    if (entry.isDouble()) {
++        *value = int(entry.toDouble());
++        return true;
++    }
++    if (entry.isString()) {
++        bool ok = false;
++        const double parsed = entry.toString().trimmed().toDouble(&ok);
++        if (ok) {
++            *value = int(parsed);
++            return true;
++        }
++    }
++    return false;
++}
++
++// Reads a point, refusing coordinates that are not numbers or fall outside
++// the screen. The error tells the model to look at the screen first, which is
++// the only way it can produce a real coordinate.
++bool pointArg(const QJsonObject &args, const QString &xName, const QString &yName, QPoint *point, QString *error, const QSize &screen)
++{
++    int x = 0;
++    int y = 0;
++    if (!numberArg(args, xName, &x) || !numberArg(args, yName, &y)) {
++        *error = QStringLiteral("The coordinates %1 and %2 must be numbers taken from a screenshot; what was given is not one. "
++                                "Call take_screenshot first and read the position off that image.")
++                     .arg(xName, yName);
++        return false;
++    }
++    if (screen.isValid() && !screen.isEmpty() && (x < 0 || y < 0 || x > screen.width() || y > screen.height())) {
++        *error = QStringLiteral("(%1, %2) is outside the screen, which is %3x%4. Take a screenshot and read the position "
++                                "off that image.")
++                     .arg(x)
++                     .arg(y)
++                     .arg(screen.width())
++                     .arg(screen.height());
++        return false;
++    }
++    *point = QPoint{x, y};
++    return true;
++}
++
++// Strips special-token markup that leaks into visible text. Observed from
++// mlx-serve with thinking enabled: the end-of-turn token arrives as literal
++// text at the end of a reply, sometimes instead of the tool call the model
++// meant to emit. Leaving it in the history teaches the model to repeat it, so
++// it is removed on the way in.
++QString stripStrayTokens(const QString &text)
++{
++    static const QRegularExpression token(QStringLiteral("<\\/?s>|<\\|im_end\\|>|<\\|endoftext\\|>"));
++    QString out = text;
++    out.remove(token);
++    return out.trimmed();
 +}
 +
 +Qt::MouseButton buttonFromName(const QString &name, bool *ok = nullptr)
@@ -364,6 +467,98 @@ index 00000000..cfed010d
 +        return AiTools::dangerReason(pending.call.name, pending.call.arguments);
 +    }
 +    return {};
++}
++
++QPixmap AiConversation::pendingPreview() const
++{
++    if (m_queueIndex >= m_queue.size()) {
++        return {};
++    }
++    const PendingTool &pending = m_queue.at(m_queueIndex);
++    const QString name = pending.call.name;
++    if (name != QLatin1String("mouse_click") && name != QLatin1String("mouse_drag") && name != QLatin1String("mouse_scroll")) {
++        return {};
++    }
++    if (!m_view || m_view->status() != RemoteView::Connected) {
++        return {};
++    }
++
++    // Work in screen pixels: the full-resolution grab, with the model's
++    // screenshot coordinates mapped in the same way runTool will map the
++    // action itself, so the crosshair marks exactly where the click lands.
++    const QPixmap screen = m_view->takeScreenshot();
++    if (screen.isNull()) {
++        return {};
++    }
++
++    const QJsonObject args = pending.call.arguments;
++    QList<QPoint> points;
++    const QSize aim = aimSize();
++    auto read = [&args, &aim](const QString &xName, const QString &yName) -> QPoint {
++        int x = 0;
++        int y = 0;
++        if (!numberArg(args, xName, &x) || !numberArg(args, yName, &y)) {
++            return QPoint{-1, -1};
++        }
++        if (aim.isValid() && !aim.isEmpty() && (x < 0 || y < 0 || x > aim.width() || y > aim.height())) {
++            return QPoint{-1, -1};
++        }
++        return QPoint{x, y};
++    };
++
++    if (name == QLatin1String("mouse_drag")) {
++        const QPoint from = read(QStringLiteral("from_x"), QStringLiteral("from_y"));
++        const QPoint to = read(QStringLiteral("to_x"), QStringLiteral("to_y"));
++        if (from.x() < 0 || to.x() < 0) {
++            return {};
++        }
++        points.append(toScreen(from));
++        points.append(toScreen(to));
++    } else {
++        const QPoint pos = read(QStringLiteral("x"), QStringLiteral("y"));
++        if (pos.x() < 0) {
++            return {};
++        }
++        points.append(toScreen(pos));
++    }
++
++    // A crop that holds every marked point with margin, so a drag shows both
++    // ends, capped so a huge drag does not shrink the target to nothing.
++    QRect bounds{QRect(points.first(), QSize{1, 1})};
++    for (const QPoint &point : points) {
++        bounds = bounds.united(QRect{point, QSize{1, 1}});
++    }
++    constexpr int Margin = 90;
++    bounds = bounds.adjusted(-Margin, -Margin, Margin, Margin).intersected(screen.rect());
++    if (bounds.isEmpty()) {
++        return {};
++    }
++    if (bounds.width() > 480 || bounds.height() > 360) {
++        // Too big to read a control in: fall back to a fixed crop on the
++        // first point (the click itself), which is always a single point.
++        const QPoint anchor = points.first();
++        bounds = QRect{anchor.x() - 160, anchor.y() - 120, 320, 240}.intersected(screen.rect());
++    }
++
++    QPixmap crop = screen.copy(bounds);
++
++    QPainter painter{&crop};
++    painter.setRenderHint(QPainter::Antialiasing);
++    QPen pen{QColor{255, 60, 60}, 2.0};
++    painter.setPen(pen);
++    for (const QPoint &point : points) {
++        const QPoint local = point - bounds.topLeft();
++        if (!bounds.contains(point)) {
++            continue;
++        }
++        constexpr int Arm = 12;
++        painter.drawLine(local.x() - Arm, local.y(), local.x() + Arm, local.y());
++        painter.drawLine(local.x(), local.y() - Arm, local.x(), local.y() + Arm);
++        painter.drawEllipse(local, 8, 8);
++    }
++    painter.end();
++
++    return crop;
 +}
 +
 +void AiConversation::setConfig(const AiConfig &config)
@@ -475,7 +670,7 @@ index 00000000..cfed010d
 +    Q_EMIT entriesChanged();
 +}
 +
-+QByteArray AiConversation::grabScreenshot() const
++QByteArray AiConversation::grabScreenshot()
 +{
 +    if (!m_view || m_view->status() != RemoteView::Connected) {
 +        return {};
@@ -497,7 +692,35 @@ index 00000000..cfed010d
 +    if (!pixmap.save(&buffer, "JPEG", std::clamp(m_config.imageQuality, 10, 100))) {
 +        return {};
 +    }
++    m_sentImageSize = pixmap.size();
 +    return bytes;
++}
++
++QPoint AiConversation::toScreen(const QPoint &pos) const
++{
++    const QSize screen = screenSize();
++    if (screen.isEmpty() || !m_sentImageSize.isValid() || m_sentImageSize.isEmpty()
++        || m_sentImageSize == screen) {
++        return pos;
++    }
++
++    // Integer math with rounding half a pixel either way is far below the
++    // size of a button; the model's own reading of the image is the coarse
++    // step here, not this conversion.
++    const int x = qRound(qreal(pos.x()) * screen.width() / m_sentImageSize.width());
++    const int y = qRound(qreal(pos.y()) * screen.height() / m_sentImageSize.height());
++    return QPoint{std::clamp(x, 0, screen.width() - 1), std::clamp(y, 0, screen.height() - 1)};
++}
++
++QSize AiConversation::aimSize() const
++{
++    // Coordinates are quoted in the pixels of the screenshot the model was
++    // last given, which is the only picture it can read a position from;
++    // before any screenshot has been sent, the screen itself is the bound.
++    if (m_sentImageSize.isValid() && !m_sentImageSize.isEmpty()) {
++        return m_sentImageSize;
++    }
++    return screenSize();
 +}
 +
 +QSize AiConversation::screenSize() const
@@ -618,8 +841,11 @@ index 00000000..cfed010d
 +{
 +    Entry entry;
 +    entry.role = Role::Assistant;
-+    entry.text = content;
++    entry.text = stripStrayTokens(content);
 +    entry.toolCalls = toolCalls;
++    for (AiToolCall &call : entry.toolCalls) {
++        call.name = stripStrayTokens(call.name);
++    }
 +    m_entries.append(entry);
 +    Q_EMIT entriesChanged();
 +
@@ -767,9 +993,68 @@ index 00000000..cfed010d
 +        if (image.isEmpty()) {
 +            failTool(call, QStringLiteral("No screenshot available. Is the connection established?"));
 +        } else {
-+            finishTool(call, QStringLiteral("Screenshot attached. Remote screen is %1x%2 pixels.").arg(screenSize().width()).arg(screenSize().height()),
++            finishTool(call,
++                       QStringLiteral("Screenshot attached; this image is %1x%2 pixels, the screen is %3x%4 pixels. "
++                                      "Point tools take coordinates in this image's pixels.")
++                           .arg(m_sentImageSize.width())
++                           .arg(m_sentImageSize.height())
++                           .arg(screenSize().width())
++                           .arg(screenSize().height()),
 +                       image);
 +        }
++        return;
++    }
++
++    if (name == QLatin1String("save_screenshot")) {
++        if (!m_view || m_view->status() != RemoteView::Connected) {
++            failTool(call, QStringLiteral("No screenshot available. Is the connection established?"));
++            return;
++        }
++
++        // The saved file is the full-resolution PNG, unlike the downscaled
++        // JPEG that goes to the model: the point of this tool is a readable
++        // image for a guide.
++        QPixmap pixmap = m_view->takeScreenshot();
++        if (pixmap.isNull()) {
++            failTool(call, QStringLiteral("No screenshot available. Is the connection established?"));
++            return;
++        }
++
++        // The model supplies only a base name; anything path-shaped is
++        // stripped so the file always lands in the configured folder.
++        QString base = args.value(QStringLiteral("filename")).toString().trimmed();
++        base.remove(QRegularExpression(QStringLiteral("[/\\\\]")));
++        base.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._ -]")), QStringLiteral("_"));
++        base = base.trimmed();
++        while (base.startsWith(QLatin1Char('.'))) {
++            base.remove(0, 1);
++        }
++        if (base.length() > 64) {
++            base.truncate(64);
++        }
++        if (base.isEmpty()) {
++            base = QDateTime::currentDateTime().toString(QStringLiteral("screenshot-yyyy-MM-dd-HHmmss"));
++        }
++
++        QDir directory(m_config.screenshotPath);
++        if (!directory.exists() && !directory.mkpath(QStringLiteral("."))) {
++            failTool(call, QStringLiteral("Could not create the screenshot folder %1.").arg(directory.absolutePath()));
++            return;
++        }
++
++        QString fileName = base + QStringLiteral(".png");
++        int suffix = 2;
++        while (directory.exists(fileName)) {
++            fileName = base + QLatin1Char('-') + QString::number(suffix++) + QStringLiteral(".png");
++        }
++
++        QFile file{directory.filePath(fileName)};
++        if (!file.open(QIODevice::WriteOnly) || !pixmap.save(&file, "PNG")) {
++            failTool(call, QStringLiteral("Could not write %1.").arg(file.fileName()));
++            return;
++        }
++
++        finishTool(call, QStringLiteral("Saved %1 (%2x%3).").arg(file.fileName()).arg(pixmap.width()).arg(pixmap.height()));
 +        return;
 +    }
 +
@@ -780,6 +1065,8 @@ index 00000000..cfed010d
 +        result.insert(QStringLiteral("url"), view ? view->url().toString() : QString());
 +        result.insert(QStringLiteral("screen_width"), size.width());
 +        result.insert(QStringLiteral("screen_height"), size.height());
++        result.insert(QStringLiteral("screenshot_width"), m_sentImageSize.width());
++        result.insert(QStringLiteral("screenshot_height"), m_sentImageSize.height());
 +        result.insert(QStringLiteral("connected"), view && view->status() == RemoteView::Connected);
 +        result.insert(QStringLiteral("input_ready"), view && view->supportsAiControl());
 +        finishTool(call, QString::fromUtf8(QJsonDocument(result).toJson(QJsonDocument::Compact)));
@@ -792,7 +1079,13 @@ index 00000000..cfed010d
 +    }
 +
 +    if (name == QLatin1String("mouse_move")) {
-+        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
++        QPoint raw;
++        QString error;
++        if (!pointArg(args, QStringLiteral("x"), QStringLiteral("y"), &raw, &error, aimSize())) {
++            failTool(call, error);
++            return;
++        }
++        const QPoint pos = toScreen(raw);
 +        view->aiMouseMove(pos);
 +        finishTool(call, QStringLiteral("Pointer moved to (%1, %2).").arg(pos.x()).arg(pos.y()));
 +        return;
@@ -806,7 +1099,13 @@ index 00000000..cfed010d
 +            return;
 +        }
 +
-+        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
++        QPoint raw;
++        QString error;
++        if (!pointArg(args, QStringLiteral("x"), QStringLiteral("y"), &raw, &error, aimSize())) {
++            failTool(call, error);
++            return;
++        }
++        const QPoint pos = toScreen(raw);
 +        const int clicks = clampInt(args.value(QStringLiteral("clicks")).toDouble(1), 1, 3, 1);
 +
 +        view->aiMouseMove(pos);
@@ -826,8 +1125,16 @@ index 00000000..cfed010d
 +            return;
 +        }
 +
-+        const QPoint from{int(args.value(QStringLiteral("from_x")).toDouble()), int(args.value(QStringLiteral("from_y")).toDouble())};
-+        const QPoint to{int(args.value(QStringLiteral("to_x")).toDouble()), int(args.value(QStringLiteral("to_y")).toDouble())};
++        QPoint rawFrom;
++        QPoint rawTo;
++        QString error;
++        if (!pointArg(args, QStringLiteral("from_x"), QStringLiteral("from_y"), &rawFrom, &error, aimSize())
++            || !pointArg(args, QStringLiteral("to_x"), QStringLiteral("to_y"), &rawTo, &error, aimSize())) {
++            failTool(call, error);
++            return;
++        }
++        const QPoint from = toScreen(rawFrom);
++        const QPoint to = toScreen(rawTo);
 +
 +        // Intermediate moves so the remote drags (text selection, window
 +        // moves) track the pointer instead of teleporting.
@@ -844,7 +1151,13 @@ index 00000000..cfed010d
 +    }
 +
 +    if (name == QLatin1String("mouse_scroll")) {
-+        const QPoint pos{int(args.value(QStringLiteral("x")).toDouble()), int(args.value(QStringLiteral("y")).toDouble())};
++        QPoint raw;
++        QString error;
++        if (!pointArg(args, QStringLiteral("x"), QStringLiteral("y"), &raw, &error, aimSize())) {
++            failTool(call, error);
++            return;
++        }
++        const QPoint pos = toScreen(raw);
 +        const QString direction = args.value(QStringLiteral("direction")).toString().toLower();
 +        const int notches = clampInt(args.value(QStringLiteral("notches")).toDouble(1), 1, 20, 1);
 +
@@ -893,30 +1206,44 @@ index 00000000..cfed010d
 +    }
 +
 +    if (name == QLatin1String("press_key")) {
-+        const QStringList modifierNames = [&args] {
-+            QStringList names;
-+            for (const QJsonValue &value : args.value(QStringLiteral("modifiers")).toArray()) {
-+                names.append(value.toString());
++        QStringList names;
++        for (const QJsonValue &value : args.value(QStringLiteral("modifiers")).toArray()) {
++            names.append(value.toString().trimmed().toLower());
++        }
++        // Models that cannot emit the modifiers array often write the whole
++        // combination into key instead: "ctrl+a". Accept both spellings.
++        names.append(AiKeys::splitChord(args.value(QStringLiteral("key")).toString()));
++        names.removeAll(QString());
++
++        QString error;
++        if (!sendChord(view, names, &error)) {
++            failTool(call, error);
++            return;
++        }
++        finishTool(call, QStringLiteral("Pressed %1.").arg(names.join(QLatin1Char('+'))));
++        return;
++    }
++
++    if (name == QLatin1String("hotkey")) {
++        // Normally one string like "ctrl+a"; the old array form is accepted
++        // too so an in-flight conversation never breaks on the schema change.
++        const QJsonValue keys = args.value(QStringLiteral("keys"));
++        QStringList names;
++        if (keys.isArray()) {
++            for (const QJsonValue &entry : keys.toArray()) {
++                names.append(AiKeys::splitChord(entry.toString()));
 +            }
-+            return names;
-+        }();
++        } else {
++            names = AiKeys::splitChord(keys.toString());
++        }
++        names.removeAll(QString());
 +
-+        QStringList unknownModifiers;
-+        const Qt::KeyboardModifiers modifiers = AiKeys::modifiers(modifierNames, unknownModifiers);
-+        if (!unknownModifiers.isEmpty()) {
-+            failTool(call, QStringLiteral("Unknown modifier key(s): %1.").arg(unknownModifiers.join(QStringLiteral(", "))));
++        QString error;
++        if (!sendChord(view, names, &error)) {
++            failTool(call, error);
 +            return;
 +        }
-+
-+        const int key = AiKeys::qtKey(args.value(QStringLiteral("key")).toString());
-+        if (key == 0) {
-+            failTool(call, QStringLiteral("Unknown key “%1”.").arg(args.value(QStringLiteral("key")).toString()));
-+            return;
-+        }
-+
-+        view->aiKeyPress(key, modifiers, true);
-+        view->aiKeyPress(key, modifiers, false);
-+        finishTool(call, QStringLiteral("Key pressed."));
++        finishTool(call, QStringLiteral("Pressed %1.").arg(names.join(QLatin1Char('+'))));
 +        return;
 +    }
 +
@@ -966,6 +1293,63 @@ index 00000000..cfed010d
 +    } else {
 +        QTimer::singleShot(m_typeDelay, this, &AiConversation::typeNextChunk);
 +    }
++}
++
++bool AiConversation::sendChord(RemoteView *view, const QStringList &names, QString *error)
++{
++    if (names.isEmpty() || names.size() > 8) {
++        *error = QStringLiteral("The key combination must hold between 1 and 8 keys.");
++        return false;
++    }
++
++    QVector<int> keys;
++    keys.reserve(names.size());
++    for (const QString &name : names) {
++        if (name == QLatin1String("backtab")) {
++            // Reverse tab is Shift+Tab: Qt has no separate key for it and the
++            // wire only knows Tab with Shift held.
++            if (!keys.contains(AiKeys::qtKey(QStringLiteral("shift")))) {
++                keys.append(AiKeys::qtKey(QStringLiteral("shift")));
++            }
++            keys.append(AiKeys::qtKey(QStringLiteral("tab")));
++            continue;
++        }
++        const int key = AiKeys::qtKey(name);
++        if (key == 0) {
++            *error = QStringLiteral("Unknown key “%1”. Use names like ctrl, alt, shift, win, return, tab, f5, or a single "
++                                    "character; join combination keys with “+”, modifiers first.")
++                         .arg(name);
++            return false;
++        }
++        keys.append(key);
++    }
++
++    // Everything but the last key is held down; the last key is tapped. Each
++    // key is pressed by its own name (no Qt modifier flags) so the down and
++    // up of each key pair up exactly, even when the tapped key is itself a
++    // modifier, e.g. ctrl+shift+tab.
++    qCDebug(KRDC) << "AI chord down:" << names.join(QLatin1Char('+'));
++    for (int i = 0; i + 1 < keys.size(); ++i) {
++        view->aiKeyPress(keys.at(i), Qt::NoModifier, true);
++    }
++    view->aiKeyPress(keys.last(), Qt::NoModifier, true);
++
++    // The final key is released immediately; the held keys are released on a
++    // short stagger. A down and its up in the same millisecond are dropped by
++    // some remote applications.
++    constexpr int StepMs = 15;
++    view->aiKeyPress(keys.last(), Qt::NoModifier, false);
++    for (int i = keys.size() - 2; i >= 0; --i) {
++        const int key = keys.at(i);
++        // Release through m_view (a QPointer): if the tab closes before the
++        // timer fires, the release is skipped instead of dangling.
++        QTimer::singleShot((keys.size() - 1 - i) * StepMs, this, [this, key] {
++            if (m_view) {
++                m_view->aiKeyPress(key, Qt::NoModifier, false);
++            }
++        });
++    }
++    return true;
 +}
 +
 +QString AiConversation::historyFilePath() const
@@ -1079,10 +1463,10 @@ index 00000000..cfed010d
 +}
 diff --git a/ai/aiconversation.h b/ai/aiconversation.h
 new file mode 100644
-index 00000000..5aabf21e
+index 00000000..cd22f606
 --- /dev/null
 +++ b/ai/aiconversation.h
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,184 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -1100,6 +1484,8 @@ index 00000000..5aabf21e
 +#include <QList>
 +#include <QObject>
 +#include <QPointer>
++#include <QPixmap>
++#include <QSize>
 +#include <QString>
 +
 +class RemoteView;
@@ -1160,6 +1546,14 @@ index 00000000..5aabf21e
 +    /** Why the pending tool call needs approval even with auto-execute on. */
 +    QString pendingReason() const;
 +
++    /**
++     * A zoomed crop of the current remote screen around the point the pending
++     * click or drag is about to act on, with a crosshair on it, so the user
++     * can see what is there before approving. Returns a null pixmap when the
++     * pending call is not a point action or no screen is available.
++     */
++    QPixmap pendingPreview() const;
++
 +    void setConfig(const AiConfig &config);
 +    const AiConfig &config() const;
 +
@@ -1175,11 +1569,26 @@ index 00000000..5aabf21e
 +    void cancel();
 +    void clear();
 +
-+    /** @return a JPEG of the remote screen, scaled down for the model. */
-+    QByteArray grabScreenshot() const;
++    /** @return a JPEG of the remote screen, scaled down for the model.
++     * Records the returned image's size so pointer coordinates the model
++     * reads off it can be mapped back to screen pixels. */
++    QByteArray grabScreenshot();
 +
 +    /** @return the size of the remote screen, or an invalid size. */
 +    QSize screenSize() const;
++
++    /** @return the size coordinates are quoted in: the last screenshot sent
++     * to the model, or the screen before any screenshot has been sent. */
++    QSize aimSize() const;
++
++    /**
++     * Maps a position the model read off the last screenshot it received
++     * to remote screen pixels. Screenshots are downscaled, so a coordinate
++     * taken from one is off by that factor; the model cannot be trusted
++     * with that arithmetic. Positions arrive in screen pixels when no
++     * screenshot has been sent (or it was sent unscaled).
++     */
++    QPoint toScreen(const QPoint &pos) const;
 +
 +Q_SIGNALS:
 +    void entriesChanged();
@@ -1203,6 +1612,13 @@ index 00000000..5aabf21e
 +    void runTool(const PendingTool &pending);
 +    void finishTool(const AiToolCall &call, const QString &result, const QByteArray &image = QByteArray());
 +    void failTool(const AiToolCall &call, const QString &message);
++
++    /**
++     * Holds every name but the last down, taps the last one, then releases
++     * the held keys on a short stagger. @p names is the combination in order,
++     * modifiers first ("ctrl", "a"). Used by both press_key and hotkey.
++     */
++    bool sendChord(RemoteView *view, const QStringList &names, QString *error);
 +    void setBusy(bool busy);
 +
 +    int startTyping(const AiToolCall &call, const QString &text, int delayMs);
@@ -1214,6 +1630,7 @@ index 00000000..5aabf21e
 +    AiHttpClient m_client;
 +    QString m_key;
 +    AiConfig m_config;
++    QSize m_sentImageSize;
 +    QList<Entry> m_entries;
 +    QPointer<RemoteView> m_view;
 +    QString m_title;
@@ -1236,10 +1653,10 @@ index 00000000..5aabf21e
 +};
 diff --git a/ai/aiconversationpage.cpp b/ai/aiconversationpage.cpp
 new file mode 100644
-index 00000000..ffc0ed5b
+index 00000000..5c162ed5
 --- /dev/null
 +++ b/ai/aiconversationpage.cpp
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,404 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -1258,6 +1675,7 @@ index 00000000..ffc0ed5b
 +#include <QLabel>
 +#include <QLocale>
 +#include <QPlainTextEdit>
++#include <QPixmap>
 +#include <QPushButton>
 +#include <QScrollBar>
 +#include <QTextBrowser>
@@ -1339,6 +1757,14 @@ index 00000000..ffc0ed5b
 +    approvalLayout->addWidget(new QLabel(QStringLiteral("<b>%1</b>").arg(i18n("The assistant wants to:")), m_approvalBar));
 +    approvalLayout->addWidget(m_approvalText);
 +    approvalLayout->addWidget(m_approvalReason);
++
++    // A zoomed crop of the screen around the point a pending click targets,
++    // so the user sees what is there, not just a coordinate.
++    m_approvalPreview = new QLabel(m_approvalBar);
++    m_approvalPreview->setAlignment(Qt::AlignCenter);
++    m_approvalPreview->setStyleSheet(QStringLiteral("border:1px solid palette(mid);"));
++    m_approvalPreview->setVisible(false);
++    approvalLayout->addWidget(m_approvalPreview);
 +    approvalLayout->addLayout(approvalButtons);
 +
 +    m_approvalBar->setStyleSheet(QStringLiteral("background:#54411f;border-radius:6px;"));
@@ -1456,6 +1882,21 @@ index 00000000..ffc0ed5b
 +    if (awaiting) {
 +        m_approvalText->setText(m_conversation->pendingSummary());
 +        m_approvalReason->setText(m_conversation->pendingReason());
++
++        const QPixmap preview = m_conversation->pendingPreview();
++        if (preview.isNull()) {
++            m_approvalPreview->setVisible(false);
++        } else {
++            // Show the crop no larger than it was captured: the panel shows
++            // the spot in context rather than a magnified close-up, which
++            // keeps the approval bar compact.
++            const int widest = qMin(preview.width(), 220);
++            m_approvalPreview->setPixmap(
++                preview.scaled(widest, 165, Qt::KeepAspectRatio, Qt::SmoothTransformation));
++            m_approvalPreview->setVisible(true);
++        }
++    } else {
++        m_approvalPreview->setVisible(false);
 +    }
 +
 +    m_approvalBar->setVisible(awaiting);
@@ -1622,10 +2063,10 @@ index 00000000..ffc0ed5b
 +#include "aiconversationpage.moc"
 diff --git a/ai/aiconversationpage.h b/ai/aiconversationpage.h
 new file mode 100644
-index 00000000..ffd4a319
+index 00000000..bf2615aa
 --- /dev/null
 +++ b/ai/aiconversationpage.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,67 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -1684,6 +2125,7 @@ index 00000000..ffd4a319
 +    QWidget *m_approvalBar;
 +    QLabel *m_approvalText;
 +    QLabel *m_approvalReason;
++    QLabel *m_approvalPreview = nullptr;
 +    QPushButton *m_approveButton;
 +    QPushButton *m_denyButton;
 +    QPlainTextEdit *m_input;
@@ -2059,10 +2501,10 @@ index 00000000..d6372667
 +};
 diff --git a/ai/aikeys.cpp b/ai/aikeys.cpp
 new file mode 100644
-index 00000000..da1a66c6
+index 00000000..cbb0ad14
 --- /dev/null
 +++ b/ai/aikeys.cpp
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,127 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2077,6 +2519,12 @@ index 00000000..da1a66c6
 +int AiKeys::qtKey(const QString &name)
 +{
 +    static const QHash<QString, int> table = {
++        {QStringLiteral("ctrl"), Qt::Key_Control},
++        {QStringLiteral("control"), Qt::Key_Control},
++        {QStringLiteral("shift"), Qt::Key_Shift},
++        {QStringLiteral("alt"), Qt::Key_Alt},
++        {QStringLiteral("option"), Qt::Key_Alt},
++        {QStringLiteral("opt"), Qt::Key_Alt},
 +        {QStringLiteral("return"), Qt::Key_Return},
 +        {QStringLiteral("enter"), Qt::Key_Return},
 +        {QStringLiteral("numpadenter"), Qt::Key_Enter},
@@ -2110,6 +2558,8 @@ index 00000000..da1a66c6
 +        {QStringLiteral("menu"), Qt::Key_Menu},
 +        {QStringLiteral("contextmenu"), Qt::Key_Menu},
 +        {QStringLiteral("win"), Qt::Key_Super_L},
++        {QStringLiteral("lwin"), Qt::Key_Super_L},
++        {QStringLiteral("rwin"), Qt::Key_Super_R},
 +        {QStringLiteral("super"), Qt::Key_Super_L},
 +        {QStringLiteral("meta"), Qt::Key_Super_L},
 +        {QStringLiteral("cmd"), Qt::Key_Super_L},
@@ -2172,12 +2622,22 @@ index 00000000..da1a66c6
 +
 +    return modifiers;
 +}
++
++QStringList AiKeys::splitChord(const QString &chord)
++{
++    QStringList names = chord.toLower().split(QLatin1Char('+'), Qt::SkipEmptyParts);
++    for (QString &name : names) {
++        name = name.trimmed();
++    }
++    names.removeAll(QString());
++    return names;
++}
 diff --git a/ai/aikeys.h b/ai/aikeys.h
 new file mode 100644
-index 00000000..49f66d8c
+index 00000000..2a327790
 --- /dev/null
 +++ b/ai/aikeys.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,41 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2207,13 +2667,24 @@ index 00000000..49f66d8c
 + * @return the matching Qt modifier mask
 + */
 +Qt::KeyboardModifiers modifiers(const QStringList &names, QStringList &unknown);
++
++/**
++ * Splits a chord written as one string, e.g. "ctrl+a" or "ctrl+shift+esc",
++ * into its key names. Models that cannot emit array arguments reliably send
++ * combinations this way even where a list was asked for, so both key tools
++ * accept it.
++ *
++ * @return the names, lower-case and empty parts removed; empty when the
++ * string holds no usable name
++ */
++QStringList splitChord(const QString &chord);
 +}
 diff --git a/ai/aipanel.cpp b/ai/aipanel.cpp
 new file mode 100644
-index 00000000..5a3ea477
+index 00000000..0f5e5597
 --- /dev/null
 +++ b/ai/aipanel.cpp
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,191 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2279,6 +2750,13 @@ index 00000000..5a3ea477
 +    QAction *action = collection->addAction(QStringLiteral("ai_assistant"), m_dock->toggleViewAction());
 +    action->setText(i18n("AI Assistant"));
 +    action->setIcon(QIcon::fromTheme(QStringLiteral("system-run")));
++    // A shortcut is the only reliable way to reach the panel while a session
++    // has the keyboard: the menu-bar toggle (Ctrl+M) is swallowed by the
++    // remote view's key handling, and the dock itself has no other control
++    // once hidden. WindowShortcut is matched before the remote view sees the
++    // key, so it works even while connected.
++    collection->setDefaultShortcut(action, QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_A));
++    action->setToolTip(i18n("Show or hide the AI Assistant panel (Ctrl+Shift+A)"));
 +}
 +
 +AiConversationPage *AiPanel::pageFor(RemoteView *view, const QString &title)
@@ -2476,10 +2954,10 @@ index 00000000..1ed65299
 +};
 diff --git a/ai/aisettingsdialog.cpp b/ai/aisettingsdialog.cpp
 new file mode 100644
-index 00000000..75d85212
+index 00000000..37de9a9e
 --- /dev/null
 +++ b/ai/aisettingsdialog.cpp
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,308 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2497,6 +2975,7 @@ index 00000000..75d85212
 +#include <QComboBox>
 +#include <QDialogButtonBox>
 +#include <QDoubleSpinBox>
++#include <QFileDialog>
 +#include <QFormLayout>
 +#include <QGroupBox>
 +#include <QHBoxLayout>
@@ -2578,6 +3057,26 @@ index 00000000..75d85212
 +    m_rememberHistory = new QCheckBox(i18n("&Remember each connection's chat history between restarts"), behaviourGroup);
 +    behaviourLayout->addWidget(m_rememberHistory);
 +
++    // Folder for the save_screenshot tool, which the assistant uses to
++    // document steps for guides.
++    auto *pathRow = new QHBoxLayout();
++    auto *pathLabel = new QLabel(i18n("Screenshot &folder:"), behaviourGroup);
++    m_screenshotPath = new QLineEdit(behaviourGroup);
++    m_screenshotPath->setPlaceholderText(AiConfig::defaultScreenshotPath());
++    pathLabel->setBuddy(m_screenshotPath);
++    auto *browseButton = new QPushButton(i18n("&Browse…"), behaviourGroup);
++    pathRow->addWidget(pathLabel);
++    pathRow->addWidget(m_screenshotPath, 1);
++    pathRow->addWidget(browseButton);
++    behaviourLayout->addLayout(pathRow);
++    connect(browseButton, &QPushButton::clicked, this, [this] {
++        const QString directory = QFileDialog::getExistingDirectory(this, i18n("Screenshot Folder"),
++                                                                    m_screenshotPath->text().trimmed());
++        if (!directory.isEmpty()) {
++            m_screenshotPath->setText(directory);
++        }
++    });
++
 +    // --- Advanced, collapsed unless the user opens it ---
 +    auto *advancedToggle = new QCheckBox(i18n("&Show advanced settings"), this);
 +    layout->addWidget(advancedToggle);
@@ -2655,6 +3154,10 @@ index 00000000..75d85212
 +    config.autoExecute = m_autoExecute->isChecked();
 +    config.attachScreenshot = m_attachScreenshot->isChecked();
 +    config.rememberHistory = m_rememberHistory->isChecked();
++    config.screenshotPath = m_screenshotPath->text().trimmed();
++    if (config.screenshotPath.isEmpty()) {
++        config.screenshotPath = AiConfig::defaultScreenshotPath();
++    }
 +    config.maxTokens = m_maxTokens->value();
 +    config.temperature = m_temperature->value();
 +    config.timeoutSeconds = m_timeout->value();
@@ -2671,6 +3174,7 @@ index 00000000..75d85212
 +    m_autoExecute->setChecked(config.autoExecute);
 +    m_attachScreenshot->setChecked(config.attachScreenshot);
 +    m_rememberHistory->setChecked(config.rememberHistory);
++    m_screenshotPath->setText(config.screenshotPath);
 +    m_maxTokens->setValue(config.maxTokens);
 +    m_temperature->setValue(config.temperature);
 +    m_timeout->setValue(config.timeoutSeconds);
@@ -2764,10 +3268,10 @@ index 00000000..75d85212
 +}
 diff --git a/ai/aisettingsdialog.h b/ai/aisettingsdialog.h
 new file mode 100644
-index 00000000..39533b0d
+index 00000000..59200f00
 --- /dev/null
 +++ b/ai/aisettingsdialog.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,59 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2820,6 +3324,7 @@ index 00000000..39533b0d
 +    QCheckBox *m_autoExecute = nullptr;
 +    QCheckBox *m_attachScreenshot = nullptr;
 +    QCheckBox *m_rememberHistory = nullptr;
++    QLineEdit *m_screenshotPath = nullptr;
 +    QSpinBox *m_maxTokens = nullptr;
 +    QDoubleSpinBox *m_temperature = nullptr;
 +    QSpinBox *m_timeout = nullptr;
@@ -2873,10 +3378,10 @@ index 00000000..d0a21673
 +}
 diff --git a/ai/aitools.cpp b/ai/aitools.cpp
 new file mode 100644
-index 00000000..e7099853
+index 00000000..92f41f92
 --- /dev/null
 +++ b/ai/aitools.cpp
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,496 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2884,6 +3389,8 @@ index 00000000..e7099853
 +*/
 +
 +#include "aitools.h"
++
++#include "aikeys.h"
 +
 +#include <QRegularExpression>
 +#include <QJsonValue>
@@ -2992,14 +3499,43 @@ index 00000000..e7099853
 +
 +QStringList normalizedChord(const QString &key, const QJsonArray &modifiers)
 +{
-+    QStringList chord;
++    QStringList chord = AiKeys::splitChord(key);
 +    for (const QJsonValue &value : modifiers) {
 +        chord.append(value.toString().toLower());
 +    }
-+    chord.append(key.toLower());
 +    chord.removeAll(QString());
 +    chord.sort();
 +    return chord;
++}
++
++// The hotkey tool's "keys" argument: normally one string like "ctrl+a";
++// models that do send the old array form are accepted too.
++QStringList hotkeyChord(const QJsonObject &arguments)
++{
++    const QJsonValue value = arguments.value(QStringLiteral("keys"));
++    QStringList names;
++    if (value.isArray()) {
++        for (const QJsonValue &entry : value.toArray()) {
++            names.append(AiKeys::splitChord(entry.toString()));
++        }
++    } else {
++        names = AiKeys::splitChord(value.toString());
++    }
++    names.removeAll(QString());
++    names.sort();
++    return names;
++}
++
++bool isDangerousChord(const QStringList &sortedChord)
++{
++    for (const DangerousChord &dangerous : dangerousChords()) {
++        QStringList expected = dangerous.keys;
++        expected.sort();
++        if (expected == sortedChord) {
++            return true;
++        }
++    }
++    return false;
 +}
 +
 +QString modifierList(const QJsonArray &modifiers)
@@ -3009,6 +3545,24 @@ index 00000000..e7099853
 +        names.append(value.toString());
 +    }
 +    return names.join(QLatin1Char('+'));
++}
++
++// An array property must declare its element schema; servers that validate
++// arguments reject or drop bare arrays, which is why press_key's modifiers
++// never arrived and the model fell back to one keystroke at a time.
++QJsonObject arrayProperty(const QString &description, const QJsonArray &allowed)
++{
++    QJsonObject items;
++    items.insert(QStringLiteral("type"), QStringLiteral("string"));
++    if (!allowed.isEmpty()) {
++        items.insert(QStringLiteral("enum"), allowed);
++    }
++
++    QJsonObject object;
++    object.insert(QStringLiteral("type"), QStringLiteral("array"));
++    object.insert(QStringLiteral("description"), description);
++    object.insert(QStringLiteral("items"), items);
++    return object;
 +}
 +
 +QString truncated(const QString &text, int limit = 70)
@@ -3061,6 +3615,10 @@ index 00000000..e7099853
 +                                   QJsonArray{QStringLiteral("left"), QStringLiteral("right"), QStringLiteral("middle")}));
 +        properties.insert(QStringLiteral("clicks"),
 +                          property(QStringLiteral("integer"), QStringLiteral("1 for a single click, 2 for a double click.")));
++        properties.insert(QStringLiteral("target"),
++                          property(QStringLiteral("string"),
++                                   QStringLiteral("What you are clicking, in a few words, e.g. \"the OK button\". Shown to the "
++                                                  "user for approval.")));
 +        tools.append(wrapped(QStringLiteral("mouse_click"), QStringLiteral("Click at a point on the remote screen."), properties,
 +                             {QStringLiteral("x"), QStringLiteral("y")}));
 +    }
@@ -3074,6 +3632,10 @@ index 00000000..e7099853
 +        properties.insert(QStringLiteral("button"),
 +                          property(QStringLiteral("string"), QStringLiteral("Which button to drag with."),
 +                                   QJsonArray{QStringLiteral("left"), QStringLiteral("right"), QStringLiteral("middle")}));
++        properties.insert(QStringLiteral("target"),
++                          property(QStringLiteral("string"),
++                                   QStringLiteral("What you are dragging and where, in a few words, e.g. \"the file into the "
++                                                  "folder\". Shown to the user for approval.")));
 +        tools.append(
 +            wrapped(QStringLiteral("mouse_drag"), QStringLiteral("Press, move and release to drag something on the remote screen."), properties,
 +                    {QStringLiteral("from_x"), QStringLiteral("from_y"), QStringLiteral("to_x"), QStringLiteral("to_y")}));
@@ -3115,11 +3677,43 @@ index 00000000..e7099853
 +                     QStringLiteral("Key to press, e.g. return, tab, escape, backspace, delete, space, up, down, left, right, "
 +                                    "home, end, pageup, pagedown, printscreen, f1…f12, win, menu, or a single character.")));
 +        properties.insert(QStringLiteral("modifiers"),
-+                          property(QStringLiteral("array"),
-+                                   QStringLiteral("Modifiers held while pressing the key: control, alt, shift, meta."),
-+                                   QJsonArray{QStringLiteral("control"), QStringLiteral("alt"), QStringLiteral("shift"), QStringLiteral("meta")}));
-+        tools.append(wrapped(QStringLiteral("press_key"), QStringLiteral("Press a key or a key combination on the remote machine."), properties,
++                          arrayProperty(QStringLiteral("Modifiers held while pressing the key: control, alt, shift, meta."),
++                                        QJsonArray{QStringLiteral("control"), QStringLiteral("alt"), QStringLiteral("shift"),
++                                                   QStringLiteral("meta")}));
++        tools.append(wrapped(QStringLiteral("press_key"),
++                             QStringLiteral("Press a single key, optionally with modifiers held. For a keyboard shortcut such as "
++                                            "Ctrl+A or Alt+Tab, prefer the hotkey tool."),
++                             properties,
 +                             {QStringLiteral("key")}));
++    }
++
++    {
++        QJsonObject properties;
++        properties.insert(
++            QStringLiteral("keys"),
++            property(QStringLiteral("string"),
++                     QStringLiteral("The combination as one string, keys joined with \"+\", modifiers first and the final key "
++                                    "last: \"ctrl+a\", \"win+d\", \"alt+tab\", \"ctrl+shift+esc\". Modifier names: ctrl, alt, "
++                                    "shift, win.")));
++        tools.append(wrapped(QStringLiteral("hotkey"),
++                             QStringLiteral("Press a keyboard shortcut on the remote machine, e.g. ctrl+a to select all. All "
++                                            "keys in the string are held down together, exactly as if you pressed the "
++                                            "combination on the keyboard yourself."),
++                             properties,
++                             {QStringLiteral("keys")}));
++    }
++
++    {
++        QJsonObject properties;
++        properties.insert(QStringLiteral("filename"),
++                          property(QStringLiteral("string"),
++                                   QStringLiteral("File name for the image, without a path, e.g. \"step-1-start-menu\". The "
++                                                  "extension is added automatically. Leave empty for a timestamped name.")));
++        tools.append(wrapped(QStringLiteral("save_screenshot"),
++                             QStringLiteral("Save a full-resolution screenshot of the remote screen as a PNG file on the "
++                                            "local computer, in the configured screenshot folder. Use it to document steps "
++                                            "for a guide; the reply gives the full path to quote in the write-up."),
++                             properties));
 +    }
 +
 +    {
@@ -3141,7 +3735,8 @@ index 00000000..e7099853
 +    static const QStringList names = {
 +        QStringLiteral("take_screenshot"), QStringLiteral("screen_info"),      QStringLiteral("mouse_move"),
 +        QStringLiteral("mouse_click"),     QStringLiteral("mouse_drag"),       QStringLiteral("mouse_scroll"),
-+        QStringLiteral("type_text"),       QStringLiteral("press_key"),        QStringLiteral("wait"),
++        QStringLiteral("type_text"),       QStringLiteral("press_key"),        QStringLiteral("hotkey"),
++        QStringLiteral("save_screenshot"), QStringLiteral("wait"),
 +    };
 +    return names.contains(name);
 +}
@@ -3164,16 +3759,14 @@ index 00000000..e7099853
 +    }
 +
 +    if (name == QLatin1String("press_key")) {
-+        const QStringList chord =
-+            normalizedChord(arguments.value(QStringLiteral("key")).toString(), arguments.value(QStringLiteral("modifiers")).toArray());
-+        for (const DangerousChord &dangerous : dangerousChords()) {
-+            QStringList expected = dangerous.keys;
-+            expected.sort();
-+            if (expected == chord) {
-+                return Risk::Dangerous;
-+            }
-+        }
-+        return Risk::Action;
++        return isDangerousChord(
++            normalizedChord(arguments.value(QStringLiteral("key")).toString(), arguments.value(QStringLiteral("modifiers")).toArray()))
++            ? Risk::Dangerous
++            : Risk::Action;
++    }
++
++    if (name == QLatin1String("hotkey")) {
++        return isDangerousChord(hotkeyChord(arguments)) ? Risk::Dangerous : Risk::Action;
 +    }
 +
 +    return Risk::Action;
@@ -3197,13 +3790,17 @@ index 00000000..e7099853
 +    if (name == QLatin1String("mouse_click")) {
 +        const QString button = arguments.value(QStringLiteral("button")).toString();
 +        const int clicks = int(arguments.value(QStringLiteral("clicks")).toDouble(1));
-+        return QStringLiteral("Click %1 button at (%2, %3)%4")
++        const QString target = arguments.value(QStringLiteral("target")).toString().trimmed();
++        return QStringLiteral("Click %1 button at (%2, %3)%4%5")
 +            .arg(button.isEmpty() ? QStringLiteral("left") : button, number(QStringLiteral("x")), number(QStringLiteral("y")),
-+                 clicks > 1 ? QStringLiteral(" (%1×)").arg(clicks) : QString());
++                 clicks > 1 ? QStringLiteral(" (%1×)").arg(clicks) : QString(),
++                 target.isEmpty() ? QString() : QStringLiteral(" — “%1”").arg(truncated(target, 60)));
 +    }
 +    if (name == QLatin1String("mouse_drag")) {
-+        return QStringLiteral("Drag from (%1, %2) to (%3, %4)")
-+            .arg(number(QStringLiteral("from_x")), number(QStringLiteral("from_y")), number(QStringLiteral("to_x")), number(QStringLiteral("to_y")));
++        const QString target = arguments.value(QStringLiteral("target")).toString().trimmed();
++        return QStringLiteral("Drag from (%1, %2) to (%3, %4)%5")
++            .arg(number(QStringLiteral("from_x")), number(QStringLiteral("from_y")), number(QStringLiteral("to_x")), number(QStringLiteral("to_y")),
++                 target.isEmpty() ? QString() : QStringLiteral(" — “%1”").arg(truncated(target, 60)));
 +    }
 +    if (name == QLatin1String("mouse_scroll")) {
 +        return QStringLiteral("Scroll %1 at (%2, %3)")
@@ -3219,6 +3816,22 @@ index 00000000..e7099853
 +            return QStringLiteral("Press %1").arg(key);
 +        }
 +        return QStringLiteral("Press %1+%2").arg(modifiers, key);
++    }
++    if (name == QLatin1String("hotkey")) {
++        QStringList chord = hotkeyChord(arguments);
++        // Show the natural reading order (ctrl+a), not the sorted match form.
++        const QJsonValue keys = arguments.value(QStringLiteral("keys"));
++        if (keys.isString()) {
++            return QStringLiteral("Press %1").arg(keys.toString());
++        }
++        return QStringLiteral("Press %1").arg(chord.join(QLatin1Char('+')));
++    }
++    if (name == QLatin1String("save_screenshot")) {
++        const QString filename = arguments.value(QStringLiteral("filename")).toString().trimmed();
++        if (filename.isEmpty()) {
++            return QStringLiteral("Save a screenshot to a new file on this computer");
++        }
++        return QStringLiteral("Save a screenshot as “%1” on this computer").arg(truncated(filename, 40));
 +    }
 +    if (name == QLatin1String("wait")) {
 +        return QStringLiteral("Wait %1 s").arg(arguments.value(QStringLiteral("seconds")).toDouble());
@@ -3243,6 +3856,17 @@ index 00000000..e7099853
 +    if (name == QLatin1String("press_key")) {
 +        const QStringList chord =
 +            normalizedChord(arguments.value(QStringLiteral("key")).toString(), arguments.value(QStringLiteral("modifiers")).toArray());
++        for (const DangerousChord &dangerous : dangerousChords()) {
++            QStringList expected = dangerous.keys;
++            expected.sort();
++            if (expected == chord) {
++                return QString::fromLatin1(dangerous.reason) + QStringLiteral(".");
++            }
++        }
++    }
++
++    if (name == QLatin1String("hotkey")) {
++        const QStringList chord = hotkeyChord(arguments);
 +        for (const DangerousChord &dangerous : dangerousChords()) {
 +            QStringList expected = dangerous.keys;
 +            expected.sort();
@@ -3682,10 +4306,10 @@ index 5e37a59c..c9fa694a 100644
      rdpgraphics.cpp
 diff --git a/rdp/rdpaiinput.cpp b/rdp/rdpaiinput.cpp
 new file mode 100644
-index 00000000..f3617341
+index 00000000..0a56244e
 --- /dev/null
 +++ b/rdp/rdpaiinput.cpp
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,201 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -3730,10 +4354,10 @@ index 00000000..f3617341
 +        {Qt::Key_Down, VK_DOWN},
 +        {Qt::Key_PageUp, VK_PRIOR},
 +        {Qt::Key_PageDown, VK_NEXT},
-+        {Qt::Key_Shift, VK_SHIFT},
-+        {Qt::Key_Control, VK_CONTROL},
++        {Qt::Key_Shift, VK_LSHIFT},
++        {Qt::Key_Control, VK_LCONTROL},
 +        {Qt::Key_Meta, VK_LWIN},
-+        {Qt::Key_Alt, VK_MENU},
++        {Qt::Key_Alt, VK_LMENU},
 +        {Qt::Key_AltGr, VK_RMENU},
 +        {Qt::Key_CapsLock, VK_CAPITAL},
 +        {Qt::Key_NumLock, VK_NUMLOCK},
@@ -3864,16 +4488,22 @@ index 00000000..f3617341
 +
 +QVector<DWORD> RdpAiInput::modifierVirtualKeys(Qt::KeyboardModifiers modifiers)
 +{
++    // Left-side specific virtual keys, not the generic VK_SHIFT/VK_CONTROL/
++    // VK_MENU aliases: winpr's virtual-key-to-scancode tables (and the RDP
++    // protocol itself) only know the specific keys, so the generic codes
++    // convert to scancode 0 and every injected combination loses its
++    // modifiers. Injecting the specific key is also what a physical
++    // left-hand keyboard press produces, which the manual input path shows.
 +    QVector<DWORD> keys;
 +
 +    if (modifiers & Qt::ShiftModifier) {
-+        keys.append(VK_SHIFT);
++        keys.append(VK_LSHIFT);
 +    }
 +    if (modifiers & Qt::ControlModifier) {
-+        keys.append(VK_CONTROL);
++        keys.append(VK_LCONTROL);
 +    }
 +    if (modifiers & Qt::AltModifier) {
-+        keys.append(VK_MENU);
++        keys.append(VK_LMENU);
 +    }
 +    if (modifiers & Qt::MetaModifier) {
 +        keys.append(VK_LWIN);
@@ -3930,7 +4560,7 @@ index 00000000..a1960f89
 +QVector<DWORD> modifierVirtualKeys(Qt::KeyboardModifiers modifiers);
 +}
 diff --git a/rdp/rdpsession.cpp b/rdp/rdpsession.cpp
-index 963f448c..bf4556e9 100644
+index 963f448c..a21d9873 100644
 --- a/rdp/rdpsession.cpp
 +++ b/rdp/rdpsession.cpp
 @@ -4,6 +4,7 @@
@@ -3941,7 +4571,7 @@ index 963f448c..bf4556e9 100644
  #include "rdpcliprdr.h"
  #include "rdpdisp.h"
  #include "rdpgraphics.h"
-@@ -1585,6 +1586,203 @@ void RdpSession::setState(RdpSession::State newState)
+@@ -1585,6 +1586,304 @@ void RdpSession::setState(RdpSession::State newState)
      Q_EMIT stateChanged();
  }
  
@@ -4046,20 +4676,121 @@ index 963f448c..bf4556e9 100644
 +    return freerdp_input_send_mouse_event(m_context.rdp->input, flags, uint16_t(remote.x()), uint16_t(remote.y()));
 +}
 +
++// Enhanced keys of a 101-key keyboard (MS-RDPBCGR 2.2.8.1.1.3.1.1.1). The
++// winpr virtual-key-to-scancode tables list these under an extended table
++// that is only consulted when the virtual key carries the KBDEXT tag, and
++// the manual input path receives that tag from the XKB key tables. Without
++// it, winpr searches the plain table, finds e.g. VK_DECIMAL instead of
++// VK_DELETE at 0x53, and converts to scancode 0.
++static DWORD extendedVirtualKey(DWORD virtualKey)
++{
++    switch (virtualKey) {
++    case VK_RETURN: // main Enter is extended; numpad Enter is a multivk
++    case VK_RCONTROL:
++    case VK_RMENU:
++    case VK_SNAPSHOT:
++    case VK_DIVIDE:
++    case VK_VOLUME_MUTE:
++    case VK_VOLUME_DOWN:
++    case VK_VOLUME_UP:
++    case VK_MEDIA_NEXT_TRACK:
++    case VK_MEDIA_PREV_TRACK:
++    case VK_MEDIA_PLAY_PAUSE:
++    case VK_MEDIA_STOP:
++    case VK_BROWSER_HOME:
++    case VK_BROWSER_SEARCH:
++    case VK_BROWSER_FAVORITES:
++    case VK_BROWSER_REFRESH:
++    case VK_BROWSER_STOP:
++    case VK_BROWSER_FORWARD:
++    case VK_BROWSER_BACK:
++    case VK_HOME:
++    case VK_UP:
++    case VK_PRIOR:
++    case VK_LEFT:
++    case VK_RIGHT:
++    case VK_END:
++    case VK_DOWN:
++    case VK_NEXT:
++    case VK_INSERT:
++    case VK_DELETE:
++    case VK_APPS:
++        return virtualKey | KBDEXT;
++    default:
++        return virtualKey;
++    }
++}
++
 +bool RdpSession::aiSendVirtualKey(DWORD virtualKey, bool pressed)
 +{
 +    if (!aiInputReady() || virtualKey == 0) {
++        qCWarning(KRDC) << "AI key refused: input ready =" << aiInputReady() << "virtual key =" << virtualKey;
 +        return false;
++    }
++
++    // Log the keyboard-type setting once per process: every virtual key is
++    // turned into an RDP scancode through it, so a wrong value here breaks
++    // all injected keys while typed text still works via the Unicode channel.
++    static bool loggedKeyboardType = false;
++    if (!loggedKeyboardType) {
++        loggedKeyboardType = true;
++        qCWarning(KRDC) << "AI input: FreeRDP_KeyboardType ="
++                        << freerdp_settings_get_uint32(m_context.rdp->settings, FreeRDP_KeyboardType);
++    }
++
++    // The Windows keys need the EXTENDED1 flag (MS-RDPBCGR 2.2.8.1.1.3.1.1.1).
++    // The virtual-key-to-scancode conversion only ever yields the plain
++    // EXTENDED flag, and the server silently drops a 0x5B/0x5C that arrives
++    // without extended1.
++    if (virtualKey == VK_LWIN || virtualKey == VK_RWIN) {
++        UINT16 flags = KBD_FLAGS_EXTENDED1;
++        if (!pressed) {
++            flags |= KBD_FLAGS_RELEASE;
++        }
++        const UINT16 code = (virtualKey == VK_LWIN) ? 0x5B : 0x5C;
++        const bool sent = freerdp_input_send_keyboard_event(m_context.rdp->input, flags, uint8_t(code));
++        qCDebug(KRDC) << "AI key" << virtualKey << (pressed ? "down" : "up") << "scancode" << code << "extended1"
++                      << "sent =" << sent;
++        return sent;
++    }
++
++    // Pause is not one scancode: a physical press is the sequence
++    // E1 1D 45 E1 9D C5 (left Ctrl + NumLock) and has no separate release.
++    if (virtualKey == VK_PAUSE) {
++        if (!pressed) {
++            return true;
++        }
++        auto *input = m_context.rdp->input;
++        bool ok = freerdp_input_send_keyboard_event(input, KBD_FLAGS_EXTENDED1, 0x1D);
++        ok = freerdp_input_send_keyboard_event(input, 0, 0x45) && ok;
++        ok = freerdp_input_send_keyboard_event(input, KBD_FLAGS_EXTENDED1 | KBD_FLAGS_RELEASE, 0x1D) && ok;
++        ok = freerdp_input_send_keyboard_event(input, KBD_FLAGS_RELEASE, 0x45) && ok;
++        qCDebug(KRDC) << "AI key" << virtualKey << "pause sequence sent =" << ok;
++        return ok;
++    }
++
++    // NumLock: winpr's table lists it unextended, but a physical press is
++    // E0 45; tagging it KBDEXT finds no table entry, so send it directly.
++    if (virtualKey == VK_NUMLOCK) {
++        UINT16 flags = KBD_FLAGS_EXTENDED;
++        if (!pressed) {
++            flags |= KBD_FLAGS_RELEASE;
++        }
++        const bool sent = freerdp_input_send_keyboard_event(m_context.rdp->input, flags, 0x45);
++        qCDebug(KRDC) << "AI key" << virtualKey << (pressed ? "down" : "up") << "scancode 69 extended sent =" << sent;
++        return sent;
 +    }
 +
 +    const auto keyboardType = freerdp_settings_get_uint32(m_context.rdp->settings, FreeRDP_KeyboardType);
-+    const DWORD code = GetVirtualScanCodeFromVirtualKeyCode(virtualKey, keyboardType);
++    const DWORD code = GetVirtualScanCodeFromVirtualKeyCode(extendedVirtualKey(virtualKey), keyboardType);
 +    if (code == 0) {
-+        qCWarning(KRDC) << "No scancode for virtual key" << virtualKey;
++        qCWarning(KRDC) << "No scancode for virtual key" << virtualKey << "keyboard type" << keyboardType;
 +        return false;
 +    }
 +
-+    return freerdp_input_send_keyboard_event_ex(m_context.rdp->input, pressed ? TRUE : FALSE, FALSE, code);
++    const bool sent = freerdp_input_send_keyboard_event_ex(m_context.rdp->input, pressed ? TRUE : FALSE, FALSE, code);
++    qCDebug(KRDC) << "AI key" << virtualKey << (pressed ? "down" : "up") << "scancode" << code << "sent =" << sent;
++    return sent;
 +}
 +
 +bool RdpSession::aiSendUnicodeChar(QChar ch)
@@ -4089,12 +4820,12 @@ index 963f448c..bf4556e9 100644
 +        if (vk != 0) {
 +            const bool shift = modifiers.testFlag(Qt::ShiftModifier);
 +            if (shift) {
-+                aiSendVirtualKey(VK_SHIFT, true);
++                aiSendVirtualKey(VK_LSHIFT, true);
 +            }
 +            const bool sent = aiSendVirtualKey(vk, true);
 +            aiSendVirtualKey(vk, false);
 +            if (shift) {
-+                aiSendVirtualKey(VK_SHIFT, false);
++                aiSendVirtualKey(VK_LSHIFT, false);
 +            }
 +            if (sent) {
 +                continue;
@@ -4321,10 +5052,10 @@ index 1600b660..4fcfc2a4 100644
  endif()
 diff --git a/test/aiengine_test.cpp b/test/aiengine_test.cpp
 new file mode 100644
-index 00000000..80cc5156
+index 00000000..716169cd
 --- /dev/null
 +++ b/test/aiengine_test.cpp
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,436 @@
 +/*
 +    Standalone test for the AI conversation engine. Not built by default; see
 +    test_ai.sh. Drives AiConversation against a mock OpenAI-compatible server
@@ -4727,6 +5458,7 @@ index 00000000..80cc5156
 +    // The mock server only offers known tools, so exercise the parser guard
 +    // through the tool schema table instead.
 +    check(!AiTools::isKnownTool(QStringLiteral("launch_nukes")), "an invented tool is not known");
++    check(AiTools::isKnownTool(QStringLiteral("save_screenshot")), "the screenshot save tool is known");
 +    check(AiTools::schemas().size() >= 8, "the schema list offers the expected number of tools");
 +    check(!AiTools::isKnownTool(QString()), "the empty name is not a tool");
 +}
