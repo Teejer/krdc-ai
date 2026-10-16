@@ -291,6 +291,15 @@ public:
      */
     QUrl url();
 
+    /**
+     * Enables or disables a client-side dark mode filter over the displayed
+     * image: light window chrome is recolored to a dark scheme while photo
+     * and video content keeps its colors (see SmartInvert). Nothing is sent
+     * to the remote machine. The default implementation does nothing:
+     * backends that do not composite the image in software cannot offer it.
+     */
+    virtual void setDarkModeFilter(bool enabled);
+
 public Q_SLOTS:
     /**
      * Called to enable or disable scaling.

@@ -10,8 +10,10 @@
 
 #include "krdc_debug.h"
 #include "rdpcursor.h"
+#include "smartinvert.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include <KMessageDialog>
 #include <KPasswordDialog>
@@ -32,6 +34,14 @@
 #include <QWindow>
 
 #include "rdpmonitorview.h"
+
+namespace {
+// Percent of white-chrome pixels under which a dark-median screen counts as
+// genuinely dark (native dark mode, fullscreen video) rather than a light
+// desktop under a dark overlay: measured 28-32% for a Start menu over white
+// windows, and text-only whites keep native dark screens near 10%.
+constexpr int s_darkChromePct = 15;
+}
 
 RdpView::RdpView(QWidget *parent, const QUrl &url, KConfigGroup configGroup, const QString &user, const QString &domain, const QString &password)
     : RemoteView(parent)
@@ -73,6 +83,27 @@ RdpView::RdpView(QWidget *parent, const QUrl &url, KConfigGroup configGroup, con
     }
 
     m_hostPreferences = std::make_unique<RdpHostPreferences>(configGroup);
+
+    // Re-read the light/dark state every two seconds while the filter is on,
+    // so a screen that became light again without new updates (the resize or
+    // fullscreen reconnect flash leaves mostly dark frames behind on a now
+    // static desktop) re-engages the filter instead of staying white.
+    m_darkRecheckTimer.setInterval(2000);
+    connect(&m_darkRecheckTimer, &QTimer::timeout, this, [this]() {
+        if (!m_darkFilterEnabled || !m_session || m_session->videoBuffer()->isNull()) {
+            return;
+        }
+        // Same hysteresis as updateDarkFilter(): re-engage above 150, drop
+        // below 110 only once white chrome has gone too, hold in between.
+        const int median = SmartInvert::medianLuma(*m_session->videoBuffer());
+        const bool chrome = SmartInvert::brightFraction(*m_session->videoBuffer()) >= s_darkChromePct;
+        const bool engage = m_darkFilterActive ? (median >= 110 || chrome) : median > 150;
+        if (engage != m_darkFilterActive) {
+            m_darkFilterActive = engage;
+            m_displaySequence = -1;
+            update();
+        }
+    });
 }
 
 RdpView::~RdpView()
@@ -572,16 +603,23 @@ void RdpView::paintEvent(QPaintEvent *event)
 
     const auto &image = *m_session->videoBuffer();
 
+    // Paint the recolored copy when the dark mode filter is engaged; the
+    // raw video buffer stays untouched for screenshots.
+    const QImage *source = &image;
+    if (m_darkFilterEnabled && updateDarkFilter(image)) {
+        source = &m_displayBuffer;
+    }
+
     if (!m_fullscreenMonitorRect.isEmpty()) {
-        const QRect sourceRect = m_fullscreenMonitorRect.intersected(image.rect());
+        const QRect sourceRect = m_fullscreenMonitorRect.intersected(source->rect());
         if (!sourceRect.isEmpty()) {
-            painter.drawImage(rect(), image, sourceRect);
+            painter.drawImage(rect(), *source, sourceRect);
         }
         painter.end();
         return;
     }
 
-    auto scaledImage = image;
+    auto scaledImage = *source;
     const qreal outputScale = m_session->outputScale();
     scaledImage.setDevicePixelRatio(outputScale);
 
@@ -591,6 +629,73 @@ void RdpView::paintEvent(QPaintEvent *event)
         painter.drawImage(QPoint{0, 0}, scaledImage);
     }
     painter.end();
+}
+
+void RdpView::setDarkModeFilter(bool enabled)
+{
+    if (m_darkFilterEnabled == enabled) {
+        return;
+    }
+    m_darkFilterEnabled = enabled;
+    m_darkFilterActive = false;
+    // Force a fresh light/dark reading on the next paint (m_updateSequence
+    // only ever grows, so -1 never matches it).
+    m_displaySequence = -1;
+    if (enabled) {
+        if (!m_darkRecheckTimer.isActive()) {
+            m_darkRecheckTimer.start();
+        }
+    } else {
+        m_darkRecheckTimer.stop();
+    }
+    update();
+}
+
+bool RdpView::updateDarkFilter(const QImage &image)
+{
+    if (m_displaySequence == m_updateSequence) {
+        // The video buffer has not changed since the last paint; the
+        // m_displayBuffer built for this sequence is still current.
+        return m_darkFilterActive;
+    }
+    m_displaySequence = m_updateSequence;
+
+    const bool wasActive = m_darkFilterActive;
+    const int median = SmartInvert::medianLuma(image);
+    // Hysteresis: engage on a clearly light screen, disengage on a clearly
+    // dark one, and hold the decision in between so a screen that is half
+    // dark window / half light window does not flicker. The disengage also
+    // demands that white chrome has vanished: a dark Start menu opening
+    // over a white desktop drops the median to ~50 while a third of the
+    // screen is still white windows, and disengaging on the median alone
+    // painted that chrome raw (see the repaint note below for why regions
+    // painted raw stayed raw). A genuinely dark remote - native dark mode,
+    // a fullscreen video - holds its bright fraction under ~10%.
+    if (median > 150) {
+        m_darkFilterActive = true;
+    } else if (median < 110 && SmartInvert::brightFraction(image) < s_darkChromePct) {
+        m_darkFilterActive = false;
+    }
+    if (m_darkFilterActive != wasActive) {
+        // A flip must repaint the whole view, not just this damage rect:
+        // regions painted while the filter was in the other state would
+        // otherwise keep those pixels until something happened to damage
+        // them again - the white band a Start menu left behind.
+        update();
+    }
+
+    if (!m_darkFilterActive) {
+        return false;
+    }
+
+    if (m_displayBuffer.size() != image.size() || m_displayBuffer.format() != QImage::Format_RGB32) {
+        m_displayBuffer = QImage(image.size(), QImage::Format_RGB32);
+    }
+    for (int y = 0; y < image.height(); ++y) {
+        memcpy(m_displayBuffer.scanLine(y), image.constScanLine(y), image.bytesPerLine());
+    }
+    SmartInvert::apply(m_displayBuffer);
+    return true;
 }
 
 void RdpView::handleKeyEvent(QKeyEvent *event)
@@ -624,6 +729,7 @@ void RdpView::handleWheelEvent(QWheelEvent *event)
 
 void RdpView::onRectangleUpdated(const QRect &remoteRect, const QSize &remoteSize)
 {
+    ++m_updateSequence;
     if (!m_fullscreenMonitorRect.isEmpty()) {
         const QRect intersection = remoteRect.intersected(m_fullscreenMonitorRect);
         if (intersection.isEmpty()) {

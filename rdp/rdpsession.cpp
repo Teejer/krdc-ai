@@ -639,6 +639,37 @@ int RdpSession::clientContextStart(rdpContext *context)
     if (!freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, true)) {
         return -1;
     }
+    // Negotiate the session experience explicitly, with ClearType font
+    // smoothing turned off. Subpixel-rendered glyphs reach the wire as
+    // colored pixels (a black glyph edge is literally cyan or orange), and
+    // those pixels are impossible for the dark mode filter to tell apart
+    // from colorful icons - they survived recoloring as colored halos
+    // around every letter. Without font smoothing the server renders text
+    // with plain grayscale antialiasing, which recolors cleanly and looks
+    // no worse over a remote connection (it is what mstsc does when "font
+    // smoothing" is unticked). The rest of the experience stays full:
+    // wallpaper, themes, drag and animations are kept. A server under
+    // group policy may ignore this request; the filter then falls back to
+    // neutralizing the fringes itself.
+    if (!freerdp_settings_set_bool(settings, FreeRDP_AllowFontSmoothing, false)) {
+        return -1;
+    }
+    if (!freerdp_settings_set_bool(settings, FreeRDP_AllowDesktopComposition, true)) {
+        return -1;
+    }
+    if (!freerdp_settings_set_bool(settings, FreeRDP_DisableWallpaper, false)) {
+        return -1;
+    }
+    if (!freerdp_settings_set_bool(settings, FreeRDP_DisableFullWindowDrag, false)) {
+        return -1;
+    }
+    if (!freerdp_settings_set_bool(settings, FreeRDP_DisableMenuAnims, false)) {
+        return -1;
+    }
+    if (!freerdp_settings_set_bool(settings, FreeRDP_DisableThemes, false)) {
+        return -1;
+    }
+    freerdp_performance_flags_make(settings);
     if (!freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, true)) {
         return -1;
     }

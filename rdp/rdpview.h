@@ -17,6 +17,7 @@
 #include <QCursor>
 #include <QHash>
 #include <QPointer>
+#include <QTimer>
 #include <QUrl>
 
 #define TCP_PORT_RDP 3389
@@ -60,6 +61,8 @@ public:
 
     QPixmap takeScreenshot() override;
 
+    void setDarkModeFilter(bool enabled) override;
+
     void savePassword(const QString &password);
 
 public Q_SLOTS:
@@ -89,6 +92,24 @@ private:
     void onRectangleUpdated(const QRect &remoteRect, const QSize &remoteSize);
     void handleError(unsigned int error);
     void updateRemoteCursor();
+
+    // Dark mode filter: the video buffer is kept raw (it is also what
+    // takeScreenshot() captures); m_displayBuffer holds the recolored copy
+    // that is painted, rebuilt when the session reports new updates. The
+    // light/dark decision has hysteresis so a mostly dark screen (native
+    // dark mode, full screen video) passes through untouched instead of
+    // flickering.
+    bool updateDarkFilter(const QImage &image);
+    // A resize or fullscreen transition can leave the screen mostly dark for
+    // a moment (reconnect flash), which disengages the filter; if the desktop
+    // then sits still, no new updates arrive to re-evaluate it. This timer
+    // re-reads the light/dark state while the filter is enabled.
+    QTimer m_darkRecheckTimer;
+    QImage m_displayBuffer;
+    qint64 m_updateSequence = 0;
+    qint64 m_displaySequence = -1;
+    bool m_darkFilterEnabled = false;
+    bool m_darkFilterActive = false;
 
     QString m_name;
     QString m_user;

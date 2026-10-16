@@ -327,6 +327,12 @@ QUrl RemoteView::url()
     return m_url;
 }
 
+void RemoteView::setDarkModeFilter(bool)
+{
+    // Backends that composite in their own window (or hardware) cannot
+    // intercept the image; the filter is opt-in per software-composited view.
+}
+
 QString RemoteView::readWalletPassword(bool fromUserNameOnly)
 {
     return readWalletPasswordForKey(fromUserNameOnly ? m_url.userName() : m_url.toDisplayString(QUrl::StripTrailingSlash));
