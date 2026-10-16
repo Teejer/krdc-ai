@@ -100,6 +100,28 @@ MainWindow::MainWindow(QWidget *parent)
 
     createDockWidget();
 
+    // Client-side dark mode filter for remote windows that have no dark
+    // theme of their own (Settings menu -> Dark Mode Filter). The filter
+    // recolors light window chrome to dark in the viewer only; see
+    // SmartInvert. The action must exist before setupGUI() parses krdcui.rc:
+    // actions added afterwards are not inserted into the menu's placeholder.
+    QAction *darkFilterAction = actionCollection()->addAction(QStringLiteral("dark_mode_filter"));
+    darkFilterAction->setText(i18n("Dark Mode Filter"));
+    darkFilterAction->setCheckable(true);
+    darkFilterAction->setChecked(Settings::darkModeFilter());
+    darkFilterAction->setToolTip(i18n("Recolor light remote windows to a dark scheme, keeping photo and video content intact (Ctrl+D)"));
+    // The menu bar is out of reach while a session holds the keyboard, so
+    // a window-level shortcut is the only way to flip the filter mid-session.
+    // A remote application that wants Ctrl+D (a browser's bookmark key, for
+    // instance) gets the filter toggle instead while this window has focus.
+    actionCollection()->setDefaultShortcut(darkFilterAction, QKeySequence(Qt::CTRL | Qt::Key_D));
+    connect(darkFilterAction, &QAction::toggled, this, [this](bool enabled) {
+        Settings::setDarkModeFilter(enabled);
+        for (RemoteView *view : std::as_const(m_remoteViewMap)) {
+            view->setDarkModeFilter(enabled);
+        }
+    });
+
     setupGUI(ToolBar | Keys | Save | Create);
 
     connect(m_tabWidget, &QTabWidget::currentChanged, this, &MainWindow::tabChanged);
@@ -347,6 +369,7 @@ void MainWindow::newConnection(const QUrl &newUrl, bool switchFullscreenWhenConn
         m_tabWidget->addTab(scrollArea, QIcon::fromTheme(QStringLiteral("krdc")), tabName.isEmpty() ? url.toDisplayString(QUrl::StripTrailingSlash) : tabName);
     m_tabWidget->setCurrentIndex(newIndex);
     m_remoteViewMap.insert(m_tabWidget->widget(newIndex), view);
+    view->setDarkModeFilter(Settings::darkModeFilter());
     tabChanged(newIndex); // force to update m_currentRemoteView (tabChanged is not emitted when start page has been disabled)
 
     view->start();

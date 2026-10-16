@@ -30,6 +30,9 @@
     <entry name="GrabAllKeysOnFullscreen" type="Bool">
       <default>true</default>
     </entry>
+    <entry name="DarkModeFilter" type="Bool">
+      <default>false</default>
+    </entry>
     <entry name="BackgroundColor" type="Color">
       <default>#00417F</default>
     </entry>

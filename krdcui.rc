@@ -18,6 +18,7 @@
     <Action name="bookmark" />
     <Menu name="settings">
         <Action name="remote_desktop_dockwidget" />
+        <Action name="dark_mode_filter" />
     </Menu>
 </MenuBar>
 <ToolBar fullWidth="false" name="krdc_remote_view_toolbar" newline="false"><text>Remote View Toolbar</text>
