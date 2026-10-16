@@ -9,6 +9,7 @@
 #include "rdpdisp.h"
 #include "rdpgraphics.h"
 #include "rdphostpreferences.h"
+#include "settings.h"
 #include "sharedfolderfield.h"
 #include "smartcardreaderfield.h"
 #ifdef HAVE_RDPDR_HOTPLUG
@@ -810,6 +811,15 @@ int RdpSession::clientContextStart(rdpContext *context)
         break;
     }
 
+    if (session->m_ignoreCertificate) {
+        // Escape hatch for environments whose RDP hosts use rotating
+        // self-signed certificates: skip certificate verification entirely
+        // instead of prompting on every rotation.
+        if (!freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, true)) {
+            return -1;
+        }
+    }
+
     if (!freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, preferences->securityNLA())) {
         return -1;
     }
@@ -1409,6 +1419,7 @@ RdpSession::RdpSession(RdpView *view)
     : QObject(nullptr)
     , m_view(view)
     , m_firstPasswordTry(true)
+    , m_ignoreCertificate(Settings::self()->ignoreCertificate())
 {
     auto entry = RdpClientEntry();
     m_context.rdp = freerdp_client_context_new(&entry);

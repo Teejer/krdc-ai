@@ -303,6 +303,7 @@ private:
     bool m_gatewayLoginEntered = false;
     bool m_ignoreSavedGatewayPassword = false;
     QString m_savedGatewayPassword;
+    bool m_ignoreCertificate;
     bool m_needKeyStateSync = true;
 
     std::thread m_thread;
