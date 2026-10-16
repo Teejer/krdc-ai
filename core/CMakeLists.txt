@@ -10,6 +10,7 @@ target_sources(krdccore PRIVATE
     remoteviewfactory.cpp
     remoteview.cpp
     hostpreferences.cpp
+    smartinvert.cpp
 )
 
 kconfig_add_kcfg_files(krdccore settings.kcfgc)
@@ -68,6 +69,7 @@ set(krdccore_HDRS
     remoteviewfactory.h
     remoteview.h
     hostpreferences.h
+    smartinvert.h
 )
 
 install(FILES ${krdccore_HDRS} DESTINATION ${KDE_INSTALL_INCLUDEDIR}/krdc COMPONENT Devel)
