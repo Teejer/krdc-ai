@@ -56,10 +56,10 @@ index ab7dc20b..e55bb982 100644
      KF6::Bookmarks
 diff --git a/ai/aiconfig.cpp b/ai/aiconfig.cpp
 new file mode 100644
-index 00000000..7111c80a
+index 00000000..4b196d84
 --- /dev/null
 +++ b/ai/aiconfig.cpp
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,158 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -181,6 +181,10 @@ index 00000000..7111c80a
 +        "the user approves the action from that and a zoomed crop of the spot.\n"
 +        "- If an action needs a password or would delete or overwrite something, stop and let "
 +        "the user do it or confirm it.\n"
++        "- Keep working until the goal is verifiably done: never end a turn by only describing "
++        "an action you were about to take - take it with a tool call instead. Finish only when "
++        "the goal is reached, when a rule above says to stop, or when you are genuinely blocked "
++        "and need to ask the user something you cannot find out yourself.\n"
 +        "- Keep answers short. Report what you did and what the screen now shows.");
 +    if (prompt.contains(QLatin1String("If the reported image size differs"))) {
 +        // The old wording made the model rescale coordinates itself, and
@@ -192,6 +196,15 @@ index 00000000..7111c80a
 +                          "image accordingly."),
 +            QStringLiteral("Point tools take coordinates in this image's pixels and are mapped to the real screen "
 +                           "for you; do not scale coordinates yourself."));
++    }
++    if (prompt.contains(QLatin1String("embedded in KRDC")) && !prompt.contains(QLatin1String("Keep working until"))) {
++        // Saved copies predate the persistence rule that stops the assistant
++        // from narrating a next step and stopping instead of taking it.
++        prompt.replace(QLatin1String("- Keep answers short."),
++                       QStringLiteral("- Keep working until the goal is verifiably done: never end a turn by only "
++                                      "describing an action you were about to take - take it with a tool call "
++                                      "instead.\n"
++                                      "- Keep answers short."));
 +    }
 +    if (prompt.contains(QLatin1String("embedded in KRDC")) && !prompt.contains(QLatin1String("hover tool"))) {
 +        // Saved copies of a previous default predate the hover tool; append
@@ -274,10 +287,10 @@ index 00000000..09f2fe6d
 +};
 diff --git a/ai/aiconversation.cpp b/ai/aiconversation.cpp
 new file mode 100644
-index 00000000..e33d7c97
+index 00000000..863319ec
 --- /dev/null
 +++ b/ai/aiconversation.cpp
-@@ -0,0 +1,1313 @@
+@@ -0,0 +1,1391 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -316,6 +329,9 @@ index 00000000..e33d7c97
 +constexpr int MaxToolRounds = 25;
 +constexpr int MaxHistoryEntries = 200;
 +constexpr int MaxTypeDelayMs = 200;
++// Gap between announcing the clipboard contents and sending Ctrl+V, so the
++// clipboard channel's announcement reaches the server before the paste.
++constexpr int PasteDelayMs = 120;
 +// The Windows input queue inside an RDP session drops synthetic key events
 +// that arrive in bursts; nothing human types 64 characters in one synchronous
 +// loop. Lost keystrokes and lost Shift transitions showed up as missing
@@ -433,6 +449,13 @@ index 00000000..e33d7c97
 +    m_client.setConfig(m_config);
 +    connect(&m_client, &AiHttpClient::replyReceived, this, &AiConversation::onReply);
 +    connect(&m_client, &AiHttpClient::requestFailed, this, &AiConversation::onFailed);
++    connect(&m_client, &AiHttpClient::infoNote, this, [this](const QString &message) {
++        Entry note;
++        note.role = Role::Note;
++        note.text = message;
++        m_entries.append(note);
++        Q_EMIT entriesChanged();
++    });
 +
 +    if (m_config.rememberHistory) {
 +        load();
@@ -634,6 +657,27 @@ index 00000000..e33d7c97
 +    m_entries.append(entry);
 +
 +    m_rounds = 0;
++    m_roundCapReached = false;
++    m_client.resetTokenBudget();
++    setBusy(true);
++    Q_EMIT entriesChanged();
++    sendToModel();
++}
++
++void AiConversation::continueAfterCap()
++{
++    if (!m_roundCapReached || busy() || m_awaiting) {
++        return;
++    }
++    m_roundCapReached = false;
++    m_rounds = 0; // a fresh batch of rounds
++    m_client.resetTokenBudget();
++
++    Entry entry;
++    entry.role = Role::User;
++    entry.text = tr("Continue");
++    m_entries.append(entry);
++
 +    setBusy(true);
 +    Q_EMIT entriesChanged();
 +    sendToModel();
@@ -653,7 +697,7 @@ index 00000000..e33d7c97
 +
 +    // Same continuation rule as processQueue(): if the tool handed work to an
 +    // async step, its slot advances the queue when it reports back.
-+    if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive) {
++    if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive || m_pasteActive) {
 +        return;
 +    }
 +    m_queueIndex++;
@@ -906,9 +950,16 @@ index 00000000..e33d7c97
 +    }
 +
 +    if (++m_rounds > MaxToolRounds) {
++        // Keep the history valid for the next request: the calls this reply
++        // announced were never run, so they must not sit in the transcript
++        // without answers. The Continue button has the model pick it up again.
++        if (!m_entries.isEmpty() && m_entries.last().role == Role::Assistant) {
++            m_entries.last().toolCalls.clear();
++        }
++        m_roundCapReached = true;
 +        Entry note;
 +        note.role = Role::Note;
-+        note.text = i18n("Too many tool calls in a row; stopping to avoid a loop. Ask me again if you want me to continue.");
++        note.text = i18n("Too many tool calls in a row; stopping to avoid a loop. Press Continue to give me %1 more rounds.").arg(MaxToolRounds);
 +        m_entries.append(note);
 +        setBusy(false);
 +        Q_EMIT entriesChanged();
@@ -973,7 +1024,7 @@ index 00000000..e33d7c97
 +        // paced typing or a wait timer. In those cases the continuation
 +        // happens in a slot; stop here so we do not run later calls out of
 +        // order.
-+        if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive) {
++        if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive || m_pasteActive) {
 +            return;
 +        }
 +        m_queueIndex++;
@@ -1295,17 +1346,39 @@ index 00000000..e33d7c97
 +            return;
 +        }
 +
-+        const int delay = clampInt(args.value(QStringLiteral("delay_ms")).toDouble(0), 0, MaxTypeDelayMs, 0);
-+        if (delay == 0) {
-+            if (view->aiTypeText(text)) {
-+                finishTool(call, QStringLiteral("Typed %1 characters.").arg(text.length()));
-+            } else {
-+                finishTool(call, QStringLiteral("Typed %1 characters, but some characters could not be injected.").arg(text.length()));
-+            }
++        QString method = args.value(QStringLiteral("method")).toString().trimmed().toLower();
++        if (method.isEmpty()) {
++            method = QStringLiteral("auto");
++        }
++        if (method != QLatin1String("keys") && method != QLatin1String("paste") && method != QLatin1String("auto")) {
++            failTool(call, QStringLiteral("Unknown typing method “%1”. Use auto, keys or paste.").arg(method));
 +            return;
 +        }
 +
-+        // Paced typing: send in chunks on a timer so the remote field keeps up.
++        // Clipboard paste carries the whole text as one payload and one
++        // Ctrl+V, so intermediate input queues - a remote session nested
++        // inside another remote session especially - have no per-character
++        // events to lose. Short strings still type as keys so the remote
++        // clipboard is not overwritten unnecessarily.
++        const bool preferPaste = method == QLatin1String("paste")
++            || (method == QLatin1String("auto") && text.length() > 8);
++        if (preferPaste && view->aiSetClipboard(text)) {
++            m_pasteCall = call;
++            m_pasteActive = true;
++            // Give the clipboard announcement a beat to reach the server
++            // before the paste keystroke.
++            QTimer::singleShot(PasteDelayMs, this, &AiConversation::pasteNow);
++            return;
++        }
++        if (method == QLatin1String("paste")) {
++            failTool(call, QStringLiteral("This connection has no clipboard channel; type with method \"keys\" instead."));
++            return;
++        }
++
++        const int delay = clampInt(args.value(QStringLiteral("delay_ms")).toDouble(0), 0, MaxTypeDelayMs, 0);
++
++        // Keys are always paced: remote input queues drop synthetic events
++        // arriving in bursts, and nested sessions drop even more.
 +        m_typeCall = call;
 +        m_typeDelay = delay;
 +        m_typeRemainder = text;
@@ -1372,6 +1445,24 @@ index 00000000..e33d7c97
 +    }
 +
 +    failTool(call, QStringLiteral("Unknown tool “%1”.").arg(name));
++}
++
++void AiConversation::pasteNow()
++{
++    m_pasteActive = false;
++    RemoteView *view = m_view;
++    if (!view || !m_busy) {
++        return;
++    }
++
++    QString error;
++    if (sendChord(view, {QStringLiteral("ctrl"), QStringLiteral("v")}, &error)) {
++        finishTool(m_pasteCall, QStringLiteral("Pasted the text through the remote clipboard."));
++    } else {
++        failTool(m_pasteCall, error);
++    }
++    m_queueIndex++;
++    processQueue();
 +}
 +
 +void AiConversation::typeNextChunk()
@@ -1593,10 +1684,10 @@ index 00000000..e33d7c97
 +}
 diff --git a/ai/aiconversation.h b/ai/aiconversation.h
 new file mode 100644
-index 00000000..9f0e7316
+index 00000000..b17a1789
 --- /dev/null
 +++ b/ai/aiconversation.h
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,208 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -1690,6 +1781,16 @@ index 00000000..9f0e7316
 +    /** True for the tools that aim the pointer at coordinates. */
 +    static bool isPointingTool(const QString &name);
 +
++    /** True when the last turn stopped at the tool-round limit; the page
++     * shows a Continue button while it holds. */
++    bool roundCapReached() const
++    {
++        return m_roundCapReached;
++    }
++
++    /** Grants another batch of tool rounds after roundCapReached(). */
++    void continueAfterCap();
++
 +    void setConfig(const AiConfig &config);
 +    const AiConfig &config() const;
 +
@@ -1735,6 +1836,7 @@ index 00000000..9f0e7316
 +    void onReply(const QString &content, const QList<AiToolCall> &toolCalls);
 +    void onFailed(const QString &message);
 +    void typeNextChunk();
++    void pasteNow();
 +
 +private:
 +    struct PendingTool {
@@ -1777,6 +1879,9 @@ index 00000000..9f0e7316
 +    QList<PendingTool> m_queue;
 +    int m_queueIndex = 0;
 +    bool m_awaiting = false;
++    bool m_pasteActive = false; ///< clipboard paste keystroke pending
++    AiToolCall m_pasteCall;
++    bool m_roundCapReached = false;
 +    QPixmap m_aimCrop; ///< set by runTool before a pointer action lands
 +    bool m_denied = false;
 +    bool m_busy = false;
@@ -1793,10 +1898,10 @@ index 00000000..9f0e7316
 +};
 diff --git a/ai/aiconversationpage.cpp b/ai/aiconversationpage.cpp
 new file mode 100644
-index 00000000..04093ab0
+index 00000000..422430d5
 --- /dev/null
 +++ b/ai/aiconversationpage.cpp
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,419 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -1928,8 +2033,13 @@ index 00000000..04093ab0
 +    m_sendButton = new QPushButton(i18n("Send"), this);
 +    m_stopButton = new QPushButton(i18n("Stop"), this);
 +    m_stopButton->setVisible(false);
++    m_continueButton = new QPushButton(i18n("Continue"), this);
++    m_continueButton->setToolTip(i18n("The assistant stopped after too many tool calls in a row. "
++                                      "This grants another batch of rounds and lets it carry on."));
++    m_continueButton->setVisible(false);
 +    inputButtons->addWidget(m_sendButton);
 +    inputButtons->addWidget(m_stopButton);
++    inputButtons->addWidget(m_continueButton);
 +    inputRow->addLayout(inputButtons);
 +    layout->addLayout(inputRow);
 +
@@ -1961,6 +2071,7 @@ index 00000000..04093ab0
 +        m_conversation->deny();
 +    });
 +    connect(m_sendButton, &QPushButton::clicked, this, &AiConversationPage::send);
++    connect(m_continueButton, &QPushButton::clicked, this, [this] { m_conversation->continueAfterCap(); });
 +    connect(inputEdit, &SubmitOnEnterEdit::submit, this, &AiConversationPage::send);
 +    connect(m_stopButton, &QPushButton::clicked, this, [this] {
 +        m_conversation->cancel();
@@ -2040,6 +2151,7 @@ index 00000000..04093ab0
 +    }
 +
 +    m_approvalBar->setVisible(awaiting);
++    m_continueButton->setVisible(m_conversation && m_conversation->roundCapReached() && !m_conversation->busy());
 +    m_input->setEnabled(m_conversation && !m_conversation->busy() && !awaiting);
 +}
 +
@@ -2211,10 +2323,10 @@ index 00000000..04093ab0
 +#include "aiconversationpage.moc"
 diff --git a/ai/aiconversationpage.h b/ai/aiconversationpage.h
 new file mode 100644
-index 00000000..bf2615aa
+index 00000000..663b0248
 --- /dev/null
 +++ b/ai/aiconversationpage.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,68 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2280,14 +2392,15 @@ index 00000000..bf2615aa
 +    QToolButton *m_screenshotButton;
 +    QPushButton *m_sendButton;
 +    QPushButton *m_stopButton;
++    QPushButton *m_continueButton;
 +    QLabel *m_statusLabel;
 +};
 diff --git a/ai/aihttpclient.cpp b/ai/aihttpclient.cpp
 new file mode 100644
-index 00000000..ed935fa3
+index 00000000..09d7ae5f
 --- /dev/null
 +++ b/ai/aihttpclient.cpp
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,361 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2340,12 +2453,14 @@ index 00000000..ed935fa3
 +    payload.insert(QStringLiteral("model"), m_config.model);
 +    payload.insert(QStringLiteral("messages"), messages);
 +    payload.insert(QStringLiteral("temperature"), m_config.temperature);
-+    payload.insert(QStringLiteral("max_tokens"), m_config.maxTokens);
++    payload.insert(QStringLiteral("max_tokens"), qMax(m_config.maxTokens, m_effectiveMaxTokens));
 +    payload.insert(QStringLiteral("stream"), false);
 +    if (!tools.isEmpty()) {
 +        payload.insert(QStringLiteral("tools"), tools);
 +        payload.insert(QStringLiteral("tool_choice"), QStringLiteral("auto"));
 +    }
++    m_lastMessages = messages;
++    m_lastTools = tools;
 +
 +    QNetworkRequest request{QUrl{m_config.chatUrl()}};
 +    request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
@@ -2428,6 +2543,78 @@ index 00000000..ed935fa3
 +
 +    qCDebug(KRDC) << "discovered" << ids.count() << "models";
 +    Q_EMIT modelsReceived(ids);
++}
++
++void AiHttpClient::resetTokenBudget()
++{
++    m_effectiveMaxTokens = 0;
++}
++
++void AiHttpClient::handleLengthCutoff()
++{
++    if (!m_ctxProbed) {
++        // Learn what the server can hold before growing the answer room past
++        // its context. Do it once per endpoint; failures just keep the
++        // conservative ceiling.
++        m_ctxProbed = true;
++        QNetworkRequest request{QUrl{m_config.modelsUrl()}};
++        if (!m_config.apiKey.isEmpty()) {
++            request.setRawHeader("Authorization", QStringLiteral("Bearer %1").arg(m_config.apiKey).toUtf8());
++        }
++        request.setTransferTimeout(std::chrono::seconds(10));
++        m_ctxReply = m_network->get(request);
++        connect(m_ctxReply, &QNetworkReply::finished, this, &AiHttpClient::onContextFinished);
++        return;
++    }
++    // Ceiling: the server's advertised context when known (never above the
++    // settings dialog's hard maximum), else that maximum.
++    const int ceiling = m_contextCeiling > 0 ? qMin(m_contextCeiling, 32768) : 32768;
++    const int current = qMax(m_config.maxTokens, m_effectiveMaxTokens);
++    if (current >= ceiling) {
++        Q_EMIT requestFailed(QStringLiteral("The answer was cut off at %1 tokens, the most this endpoint will take. "
++                                            "Try a shorter question or fewer screenshots.")
++                                 .arg(ceiling));
++        return;
++    }
++    m_effectiveMaxTokens = qMin(current * 2, ceiling);
++    Q_EMIT infoNote(QStringLiteral("The answer hit the token limit; retrying with room for %1 tokens.").arg(m_effectiveMaxTokens));
++    request(m_lastMessages, m_lastTools);
++}
++
++void AiHttpClient::onContextFinished()
++{
++    if (!m_ctxReply) {
++        return;
++    }
++
++    QNetworkReply *reply = m_ctxReply.data();
++    m_ctxReply.clear();
++    reply->deleteLater();
++
++    if (reply->error() == QNetworkReply::NoError) {
++        const QJsonDocument document = QJsonDocument::fromJson(reply->readAll());
++        const QJsonArray data = document.object().value(QStringLiteral("data")).toArray();
++        for (const QJsonValue &value : data) {
++            const QJsonObject model = value.toObject();
++            if (model.value(QStringLiteral("id")).toString() != m_config.model) {
++                continue;
++            }
++            // Every server names its context window differently.
++            for (const QString &key : {QStringLiteral("context_length"), QStringLiteral("context_window"),
++                                       QStringLiteral("max_context_length"), QStringLiteral("max_model_len"),
++                                       QStringLiteral("n_ctx"), QStringLiteral("max_position_embeddings")}) {
++                const int found = model.value(key).toInt(0);
++                if (found > 0) {
++                    m_contextCeiling = found;
++                    break;
++                }
++            }
++            break;
++        }
++    }
++
++    qCDebug(KRDC) << "server context ceiling:" << m_contextCeiling;
++    handleLengthCutoff();
 +}
 +
 +static QString contentToText(const QJsonValue &content)
@@ -2565,11 +2752,10 @@ index 00000000..ed935fa3
 +    if (content.isEmpty() && toolCalls.isEmpty()) {
 +        const QString finish = choice.value(QStringLiteral("finish_reason")).toString();
 +        if (finish == QLatin1String("length")) {
-+            Q_EMIT requestFailed(QStringLiteral("The answer was cut off at the token limit. Increase the answer length in the "
-+                                                "assistant settings."));
-+        } else {
-+            Q_EMIT requestFailed(QStringLiteral("The model answered with an empty message."));
++            handleLengthCutoff();
++            return;
 +        }
++        Q_EMIT requestFailed(QStringLiteral("The model answered with an empty message."));
 +        return;
 +    }
 +
@@ -2578,10 +2764,10 @@ index 00000000..ed935fa3
 +}
 diff --git a/ai/aihttpclient.h b/ai/aihttpclient.h
 new file mode 100644
-index 00000000..d6372667
+index 00000000..e6feb02c
 --- /dev/null
 +++ b/ai/aihttpclient.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,83 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -2625,6 +2811,10 @@ index 00000000..d6372667
 +    void request(const QJsonArray &messages, const QJsonArray &tools);
 +    void cancel();
 +
++    /** Forgets any grown token budget; the next request uses the configured
++     * limit again. Called when a new user turn starts. */
++    void resetTokenBudget();
++
 +    /**
 +     * Asks the server's /models endpoint which models it is serving.
 +     * Independent of the chat request state, so it can run while a
@@ -2635,17 +2825,31 @@ index 00000000..d6372667
 +Q_SIGNALS:
 +    void replyReceived(const QString &content, const QList<AiToolCall> &toolCalls);
 +    void requestFailed(const QString &message);
++    /** Progress the user should see but that is not an error, e.g. the
++     * answer room being grown after a cutoff. */
++    void infoNote(const QString &message);
 +    void modelsReceived(const QStringList &modelIds);
 +    void modelsFailed(const QString &message);
 +
 +private:
 +    void onFinished();
 +    void onModelsFinished();
++    void onContextFinished();
++    /** Called when a reply came back cut off at the token limit: discovers
++     * the server's context size once, then doubles the answer room and
++     * retries, or gives up at the ceiling. */
++    void handleLengthCutoff();
 +
 +    QNetworkAccessManager *m_network;
 +    QPointer<QNetworkReply> m_reply;
 +    QPointer<QNetworkReply> m_modelsReply;
++    QPointer<QNetworkReply> m_ctxReply;
 +    AiConfig m_config;
++    int m_effectiveMaxTokens = 0; ///< 0 = use the configured limit
++    int m_contextCeiling = 0; ///< from the server, 0 = unknown
++    bool m_ctxProbed = false;
++    QJsonArray m_lastMessages;
++    QJsonArray m_lastTools;
 +};
 diff --git a/ai/aikeys.cpp b/ai/aikeys.cpp
 new file mode 100644
@@ -3526,10 +3730,10 @@ index 00000000..d0a21673
 +}
 diff --git a/ai/aitools.cpp b/ai/aitools.cpp
 new file mode 100644
-index 00000000..3f51fe09
+index 00000000..622dbb0a
 --- /dev/null
 +++ b/ai/aitools.cpp
-@@ -0,0 +1,527 @@
+@@ -0,0 +1,535 @@
 +/*
 +    SPDX-FileCopyrightText: 2026 TJ Griffiths <teej.d.man@gmail.com>
 +
@@ -3836,11 +4040,19 @@ index 00000000..3f51fe09
 +                                   QStringLiteral("The text to type at the current remote focus. Use \\n for Enter.")));
 +        properties.insert(QStringLiteral("delay_ms"),
 +                          property(QStringLiteral("integer"),
-+                                   QStringLiteral("Milliseconds to pause between characters. Use 50 or more for terminals "
-+                                                  "and search boxes that drop characters.")));
++                                   QStringLiteral("Milliseconds to pause between keystrokes when typing character by "
++                                                  "character. Use 50 or more on slow or nested remote sessions.")));
++        properties.insert(QStringLiteral("method"),
++                          property(QStringLiteral("string"),
++                                   QStringLiteral("auto (default): text longer than a few characters goes through the "
++                                                  "remote clipboard and is pasted, which survives nested remote sessions; "
++                                                  "keys: type every character as keystrokes (use for fields that reject "
++                                                  "pasting, like password boxes); paste: always use the clipboard.")));
 +        tools.append(wrapped(QStringLiteral("type_text"),
 +                             QStringLiteral("Type text into whatever has the keyboard focus on the remote machine. Click the "
-+                                            "field first so focus is where you expect."),
++                                            "field first so focus is where you expect. If the text arrives garbled or with "
++                                            "missing characters, retry with method \"keys\" and delay_ms 60, or take a "
++                                            "screenshot to check before retrying."),
 +                             properties,
 +                             {QStringLiteral("text")}));
 +    }
@@ -4151,10 +4363,10 @@ index 3a3bec37..6f6e8c1a 100644
        <default>#00417F</default>
      </entry>
 diff --git a/core/remoteview.cpp b/core/remoteview.cpp
-index cfb54769..340940f3 100644
+index cfb54769..070cc895 100644
 --- a/core/remoteview.cpp
 +++ b/core/remoteview.cpp
-@@ -383,6 +383,74 @@ bool RemoteView::acceptPasswordDialog(const KPasswordDialog &dialog)
+@@ -383,6 +383,79 @@ bool RemoteView::acceptPasswordDialog(const KPasswordDialog &dialog)
      return dialog.keepPassword();
  }
  
@@ -4195,6 +4407,11 @@ index cfb54769..340940f3 100644
 +    return false;
 +}
 +
++bool RemoteView::aiSetClipboard(const QString &)
++{
++    return false;
++}
++
 +void RemoteView::setKeyboardGrabSuspended(bool suspended)
 +{
 +    if (m_keyboardGrabSuspended == suspended) {
@@ -4229,7 +4446,7 @@ index cfb54769..340940f3 100644
  QString RemoteView::readWalletPassword(bool fromUserNameOnly)
  {
      return readWalletPasswordForKey(fromUserNameOnly ? m_url.userName() : m_url.toDisplayString(QUrl::StripTrailingSlash));
-@@ -492,7 +560,7 @@ QCursor RemoteView::localDefaultCursor() const
+@@ -492,7 +565,7 @@ QCursor RemoteView::localDefaultCursor() const
  
  void RemoteView::focusInEvent(QFocusEvent *event)
  {
@@ -4238,7 +4455,7 @@ index cfb54769..340940f3 100644
          m_keyboardIsGrabbed = true;
          grabKeyboard();
      }
-@@ -550,6 +618,14 @@ bool RemoteView::event(QEvent *event)
+@@ -550,6 +623,14 @@ bool RemoteView::event(QEvent *event)
      case QEvent::MouseButtonPress:
      case QEvent::MouseButtonRelease:
      case QEvent::MouseMove:
@@ -4254,10 +4471,10 @@ index cfb54769..340940f3 100644
          return true;
          break;
 diff --git a/core/remoteview.h b/core/remoteview.h
-index fa3c9ef1..bd03c50c 100644
+index fa3c9ef1..1dd73943 100644
 --- a/core/remoteview.h
 +++ b/core/remoteview.h
-@@ -298,6 +298,79 @@ public:
+@@ -298,6 +298,87 @@ public:
       */
      QUrl url();
  
@@ -4313,6 +4530,14 @@ index fa3c9ef1..bd03c50c 100644
 +    virtual bool aiTypeText(const QString &text);
 +
 +    /**
++     * Places @p text on the remote machine's clipboard without touching the
++     * local one. The view can then paste it with one keystroke, which beats
++     * per-character injection over lossy or nested connections.
++     * @return false when the view has no clipboard channel.
++     */
++    virtual bool aiSetClipboard(const QString &text);
++
++    /**
 +     * Temporarily gives up an exclusive keyboard grab, e.g. while the user is
 +     * typing into a widget outside the remote view such as the AI chat panel.
 +     * Unlike setGrabAllKeys() this does not change the user's setting: the
@@ -4337,7 +4562,7 @@ index fa3c9ef1..bd03c50c 100644
  public Q_SLOTS:
      /**
       * Called to enable or disable scaling.
-@@ -494,6 +567,7 @@ protected:
+@@ -494,6 +575,7 @@ protected:
      bool m_canceledByUser = false;
      bool m_viewOnly;
      bool m_grabAllKeys;
@@ -5936,7 +6161,7 @@ index 2a9ff838..e6cd0137 100644
      void initializeDisplay(RdpContext *krdp, DispClientContext *disp);
      void destroyClipboard();
 diff --git a/rdp/rdpview.cpp b/rdp/rdpview.cpp
-index 09bb26d6..fe632c80 100644
+index 09bb26d6..01e93be8 100644
 --- a/rdp/rdpview.cpp
 +++ b/rdp/rdpview.cpp
 @@ -10,8 +10,10 @@
@@ -5993,7 +6218,7 @@ index 09bb26d6..fe632c80 100644
  }
  
  RdpView::~RdpView()
-@@ -646,6 +677,52 @@ QPixmap RdpView::takeScreenshot()
+@@ -646,6 +677,64 @@ QPixmap RdpView::takeScreenshot()
      return QPixmap{};
  }
  
@@ -6043,10 +6268,22 @@ index 09bb26d6..fe632c80 100644
 +    return m_session->aiTypeText(text) == 0;
 +}
 +
++bool RdpView::aiSetClipboard(const QString &text)
++{
++    if (!m_session) {
++        return false;
++    }
++    QMimeData *mimeData = new QMimeData;
++    mimeData->setText(text);
++    const bool sent = m_session->sendClipboard(mimeData);
++    delete mimeData;
++    return sent;
++}
++
  bool RdpView::supportsScaling() const
  {
      return true;
-@@ -810,16 +887,23 @@ void RdpView::paintEvent(QPaintEvent *event)
+@@ -810,16 +899,23 @@ void RdpView::paintEvent(QPaintEvent *event)
  
      const auto &image = *m_session->videoBuffer();
  
@@ -6073,7 +6310,7 @@ index 09bb26d6..fe632c80 100644
      const qreal outputScale = m_session->outputScale();
      scaledImage.setDevicePixelRatio(outputScale);
  
-@@ -831,6 +915,73 @@ void RdpView::paintEvent(QPaintEvent *event)
+@@ -831,6 +927,73 @@ void RdpView::paintEvent(QPaintEvent *event)
      painter.end();
  }
  
@@ -6147,7 +6384,7 @@ index 09bb26d6..fe632c80 100644
  void RdpView::handleKeyEvent(QKeyEvent *event)
  {
      if (m_session) {
-@@ -862,6 +1013,7 @@ void RdpView::handleWheelEvent(QWheelEvent *event)
+@@ -862,6 +1025,7 @@ void RdpView::handleWheelEvent(QWheelEvent *event)
  
  void RdpView::onRectangleUpdated(const QRect &remoteRect, const QSize &remoteSize)
  {
@@ -6156,7 +6393,7 @@ index 09bb26d6..fe632c80 100644
          const QRect intersection = remoteRect.intersected(m_fullscreenMonitorRect);
          if (intersection.isEmpty()) {
 diff --git a/rdp/rdpview.h b/rdp/rdpview.h
-index 5ccd2aca..8730468e 100644
+index 5ccd2aca..96ba046a 100644
 --- a/rdp/rdpview.h
 +++ b/rdp/rdpview.h
 @@ -17,6 +17,7 @@
@@ -6167,7 +6404,7 @@ index 5ccd2aca..8730468e 100644
  #include <QUrl>
  
  #define TCP_PORT_RDP 3389
-@@ -60,6 +61,14 @@ public:
+@@ -60,6 +61,15 @@ public:
  
      QPixmap takeScreenshot() override;
  
@@ -6177,12 +6414,13 @@ index 5ccd2aca..8730468e 100644
 +    void aiMouseWheel(const QPoint &pos, const QPoint &angleDelta) override;
 +    void aiKeyPress(int key, Qt::KeyboardModifiers modifiers, bool pressed) override;
 +    bool aiTypeText(const QString &text) override;
++    bool aiSetClipboard(const QString &text) override;
 +    void setDarkModeFilter(bool enabled) override;
 +
  public Q_SLOTS:
      void scaleResize(int w, int h) override;
      void onAuthRequested();
-@@ -89,6 +98,23 @@ private:
+@@ -89,6 +99,23 @@ private:
      void handleError(unsigned int error);
      void updateRemoteCursor();
  
