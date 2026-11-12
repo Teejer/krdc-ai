@@ -146,15 +146,17 @@ cp -r "$prefix/plugins" "$dist/plugins"
 # FreeRDP 3 loads its channel plugins dynamically at runtime; keep MSYS2's
 # lib/freerdp3 next to bin/ so winpr's module search (relative to the
 # executable) finds them in the portable tree.
-mkdir -p "$dist/lib" "$dist/share/icons"
+mkdir -p "$dist/lib"
 cp -r "$MINGW_PREFIX/lib/freerdp3" "$dist/lib/freerdp3"
 
 # Qt runtime: platform/style/imageformat plugins, Qt dlls, mingw runtimes.
 "$MINGW_PREFIX/bin/windeployqt.exe" --release --compiler-runtime \
   --no-translations "$dbin/krdc.exe" >/dev/null
 
-# KIconThemes falls back to the breeze theme for QIcon::fromTheme().
-cp -r "$MINGW_PREFIX/share/icons/breeze" "$dist/share/icons/breeze"
+# Breeze icons on Windows ship as binary Qt resources, not an SVG tree
+# (MSYS2/Craft distribute them this way). KF6 apps pick them up from a
+# data/ directory next to the executable.
+cp -r "$MINGW_PREFIX/bin/data" "$dbin/data"
 
 # Copy every MSYS2 dll the binaries import (KF6, FreeRDP, winpr, qtkeychain,
 # openssl, ...) into bin/, recursively. Anything outside $MINGW_PREFIX/bin is
