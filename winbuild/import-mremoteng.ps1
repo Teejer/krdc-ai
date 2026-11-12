@@ -23,11 +23,14 @@
     clobber the import.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\import-mremoteng.ps1
+    Unblock-File .\import-mremoteng.ps1
+    powershell -ExecutionPolicy RemoteSigned -File .\import-mremoteng.ps1
     Default paths: %APPDATA%\mRemoteNG\confCons.xml -> %LOCALAPPDATA%\krdc\bookmarks.xml
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\import-mremoteng.ps1 -IncludeVNC -ImportFolderName "From mRemoteNG"
+    powershell -ExecutionPolicy RemoteSigned -File .\import-mremoteng.ps1 -IncludeVNC -ImportFolderName "From mRemoteNG"
+    (Unblock-File first clears the downloaded-from-internet mark on this file;
+    RemoteSigned applies to this process only, not the machine.)
 #>
 [CmdletBinding()]
 param(

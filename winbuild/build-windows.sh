@@ -204,6 +204,11 @@ copy_deps "$dbin/krdc.exe" \
   "$dbin"/krdc/kcms/*.dll \
   "$dist"/lib/freerdp3/*.dll
 
+# mRemoteNG -> KRDC connection importer, shipped alongside the app so a
+# fresh Windows machine needs nothing else to migrate (usage in the file's
+# own comment header and the README below).
+cp "$repo/winbuild/import-mremoteng.ps1" "$dist/"
+
 cat >"$dist/README.txt" <<EOF
 krdc-ai $pkgver (pkgrel $pkgrel), Windows x86_64, RDP-only build
 
@@ -215,6 +220,17 @@ Run bin/krdc.exe. Nothing to install.
 * AI assistant: enable the dock in the menu; any OpenAI-compatible
   endpoint (Ollama, llama.cpp, openai.com, ...). API keys are stored in
   the Windows credential store.
+* Migrating from mRemoteNG: close KRDC, then run these in PowerShell
+  from this folder (feel free to open the script in Notepad and read
+  it first):
+    Unblock-File .\import-mremoteng.ps1
+    powershell -ExecutionPolicy RemoteSigned -File .\import-mremoteng.ps1
+  Unblock-File only clears the "downloaded from the internet" mark on
+  this one file; RemoteSigned applies to this window, not the machine.
+  The script mirrors your mRemoteNG folders and RDP connections into a
+  "mRemoteNG import" bookmark folder; passwords are never moved (KRDC
+  asks once per host and stores them in the Windows credential store).
+  Re-running only adds what's new.
 * VNC and SPICE are not in this build.
 EOF
 
