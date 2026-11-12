@@ -8,6 +8,14 @@ upstream code that Linux CI never compiles.
    there). It is not part of FreeRDP's public API; WLog only wants a tag
    string.
 
+2. factorwidget.h: FactorWidget is marked KRDCCORE_EXPORT but factorwidget.cpp
+   is compiled into the krdc executable, not krdccore. On Linux the macro is
+   just default visibility and the in-executable definition satisfies the
+   references. On Windows it becomes __declspec(dllimport), so mainwindow.cpp
+   and factorwidget.cpp reference __imp_ thunks that no import library
+   provides, and linking fails. Nothing outside the executable uses
+   FactorWidget, so the export macro is simply wrong; drop it.
+
 diff --git a/rdp/rdpsession.cpp b/rdp/rdpsession.cpp
 --- a/rdp/rdpsession.cpp
 +++ b/rdp/rdpsession.cpp
@@ -22,3 +30,14 @@ diff --git a/rdp/rdpsession.cpp b/rdp/rdpsession.cpp
          return false;
      }
  #endif
+diff --git a/factorwidget.h b/factorwidget.h
+--- a/factorwidget.h
++++ b/factorwidget.h
+@@ -17,6 +17,6 @@
+  * Widget Action to display slider in the action toolbar. Each time action is
+  * add, the new QSlider widget is created via @ref createWidget() method.
+  */
+-class KRDCCORE_EXPORT FactorWidget : public QWidgetAction
++class FactorWidget : public QWidgetAction
+ {
+     Q_OBJECT
