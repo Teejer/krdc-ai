@@ -25,8 +25,6 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
-    env:
-      KRDC_WIN_WORK: ${{ runner.temp }}/krdc-win
     steps:
       - uses: actions/checkout@v4
 
@@ -40,11 +38,15 @@ jobs:
 
       - name: Build portable zip
         shell: msys2 {0}
+        env:
+          KRDC_WIN_WORK: ${{ runner.temp }}/krdc-win
         run: ./winbuild/build-windows.sh
 
       - name: AI engine test (advisory)
         continue-on-error: true
         shell: msys2 {0}
+        env:
+          KRDC_WIN_WORK: ${{ runner.temp }}/krdc-win
         run: ./winbuild/build-windows.sh --test
 
       - uses: actions/upload-artifact@v4
