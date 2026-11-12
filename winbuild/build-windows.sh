@@ -148,6 +148,9 @@ cp -r "$prefix/plugins" "$dist/plugins"
 # executable) finds them in the portable tree.
 mkdir -p "$dist/lib"
 cp -r "$MINGW_PREFIX/lib/freerdp3" "$dist/lib/freerdp3"
+# cmake/MSYS2 leave MinGW import libs (.dll.a) beside the plugins; the runtime
+# needs only the .dll, so drop the link-time stubs from the portable tree.
+find "$dist" -name '*.dll.a' -delete
 
 # Qt runtime: platform/style/imageformat plugins, Qt dlls, mingw runtimes.
 "$MINGW_PREFIX/bin/windeployqt.exe" --release --compiler-runtime \
@@ -155,8 +158,11 @@ cp -r "$MINGW_PREFIX/lib/freerdp3" "$dist/lib/freerdp3"
 
 # Breeze icons on Windows ship as binary Qt resources, not an SVG tree
 # (MSYS2/Craft distribute them this way). KF6 apps pick them up from a
-# data/ directory next to the executable.
-cp -r "$MINGW_PREFIX/bin/data" "$dbin/data"
+# data/ directory next to the executable. Copy only the icon resources; the
+# package's bin/data also holds unrelated data from other KF6 packages.
+mkdir -p "$dbin/data/icons"
+cp -r "$MINGW_PREFIX/bin/data/icons/breeze" "$dbin/data/icons/breeze"
+cp "$MINGW_PREFIX/bin/data/icontheme.rcc" "$dbin/data/"
 
 # Copy every MSYS2 dll the binaries import (KF6, FreeRDP, winpr, qtkeychain,
 # openssl, ...) into bin/, recursively. Anything outside $MINGW_PREFIX/bin is
@@ -177,7 +183,7 @@ copy_deps() {
         cp "$found" "$dbin/$dep"
         queue+=("$dbin/$dep")
       fi
-    done < <(objdump -p "$f" 2>/dev/null | awk 'tolower($1)=="dll" && tolower($2)=="name"{print $3}')
+    done < <(objdump -p "$f" 2>/dev/null | awk 'tolower($1)=="dll" && tolower($2) ~ /^name:?$/{print $3}')
   done
 }
 copy_deps "$dbin/krdc.exe" \
