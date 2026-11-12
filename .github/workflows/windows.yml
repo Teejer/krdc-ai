@@ -22,6 +22,11 @@ on:
       - winbuild/**
       - .github/workflows/windows.yml
 
+# Needed so the "Publish release asset" step can create the release on v* tags;
+# the default GITHUB_TOKEN is read-only on this repo.
+permissions:
+  contents: write
+
 jobs:
   windows:
     runs-on: windows-latest
