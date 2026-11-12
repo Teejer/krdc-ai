@@ -93,10 +93,16 @@ rm -rf "$prefix"
 # carries KRDC_PLUGIN_INSTALL_DIR as "<exe dir>/../<QTPLUGINDIR>" and loads
 # <that>/krdc at runtime, so plugins installed under the same relative dir
 # are found in the portable layout without any env setup.
+# LibSSH is off deliberately: MSYS2's FreeRDP drags it in, which would make
+# core/sshtunnelthread.cpp part of the build, and that file is POSIX sockets
+# (arpa/inet.h, poll.h) that MinGW cannot compile. SSH-tunnelled connections
+# are an optional Linux feature; without it FindLibSSH fails softly and the
+# file is not built at all.
 cmake -S "$src" -B "$build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$(cygpath -w "$prefix")" \
   -DWITH_RDP=YES -DWITH_VNC=NO -DWITH_SPICE=NO -DWITH_AI=YES \
+  -DCMAKE_DISABLE_FIND_PACKAGE_LibSSH=YES \
   -DKDE_INSTALL_QTPLUGINDIR=plugins -DKDE_INSTALL_PLUGINDIR=plugins
 cmake --build "$build"
 cmake --install "$build"
@@ -108,6 +114,16 @@ cmake --install "$build"
 # Advisory for now: the mock-server harness under Windows is the new part
 # here, not the code under test, and a green artifact should not hinge on it.
 if ((run_test)); then
+  # run_ai_test.sh reconfigures its own build dir with default options and
+  # only builds the test target, so the absent VNC *plugin* sources never
+  # compile; libvncserver is installed above purely so its configure finds
+  # libvncclient. Pre-seed the cache with the LibSSH disable (cmake keeps
+  # cached values that the script's own command line does not set) so
+  # sshtunnelthread.cpp is skipped there too.
+  # Advisory for now: the mock-server harness under Windows is the new part
+  # here, not the code under test, and a green artifact should not hinge on it.
+  cmake -S "$src" -B "$work/build-test" -G Ninja \
+    -DCMAKE_DISABLE_FIND_PACKAGE_LibSSH=YES >/dev/null
   if ! "$src/test/run_ai_test.sh" "$work/build-test"; then
     echo "::warning::AI engine test failed on Windows (advisory; artifact still produced)"
   fi
