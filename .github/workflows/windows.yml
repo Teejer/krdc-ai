@@ -1,0 +1,64 @@
+# Builds the Windows (RDP-only) portable zip of krdc-ai and uploads it as an
+# artifact; pushes of v* tags also publish it to the GitHub release. The real
+# logic lives in winbuild/build-windows.sh so the exact same build can be run
+# locally inside an MSYS2 UCRT64 shell.
+
+name: windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - pkg/PKGBUILD
+      - pkg/krdc-ai.patch
+      - winbuild/**
+      - .github/workflows/windows.yml
+  pull_request:
+    paths:
+      - pkg/PKGBUILD
+      - pkg/krdc-ai.patch
+      - winbuild/**
+      - .github/workflows/windows.yml
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      KRDC_WIN_WORK: ${{ runner.temp }}/krdc-win
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build script installs the actual dependency set itself (single
+      # source of truth); the runner only needs a usable UCRT64 base.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: git
+
+      - name: Build portable zip
+        shell: msys2 {0}
+        run: ./winbuild/build-windows.sh
+
+      - name: AI engine test (advisory)
+        continue-on-error: true
+        shell: msys2 {0}
+        run: ./winbuild/build-windows.sh --test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: krdc-ai-windows
+          path: ${{ runner.temp }}\krdc-win\dist\*.zip
+
+      - name: Publish release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          work=$(cygpath -u "$RUNNER_TEMP")
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "krdc-ai $GITHUB_REF_NAME" \
+            "$work"/krdc-win/dist/*.zip

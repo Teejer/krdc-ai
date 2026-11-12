@@ -34,6 +34,12 @@ and is under review upstream:
 
 Arch: `yay -S krdc-ai` (replaces the repo `krdc`, config carries over).
 
+Windows: grab the latest `krdc-ai-windows` artifact (portable zip, RDP-only)
+from the Actions tab, or the asset on any `v*` release; build locally with
+`winbuild/build-windows.sh` inside an MSYS2 UCRT64 shell. The dark mode
+filter (Ctrl+D) and the AI panel work there; the app chrome follows the
+Windows dark-mode setting via Qt's native style.
+
 Manual: clone upstream [invent.kde.org/network/krdc](https://invent.kde.org/network/krdc)
 at the commit pinned in `pkg/PKGBUILD`, apply `pkg/krdc-ai.patch`, build
 with CMake (`WITH_AI` is on by default).
@@ -43,6 +49,7 @@ with CMake (`WITH_AI` is on by default).
 | Path | Contents |
 |---|---|
 | `pkg/` | AUR package: `PKGBUILD`, `krdc-ai.patch` (the whole feature, squashed), `.SRCINFO`, packaging README |
+| `winbuild/` | Portable Windows (RDP-only) build script, run by the `windows` GitHub Action or locally in MSYS2 UCRT64 |
 | `MERGE_REQUEST.md` | The upstream MR description + submission record |
 | `ai-assistant` branch (in `krdc/` history) | The six-commit review series |
 
