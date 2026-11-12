@@ -83,6 +83,10 @@ mkdir -p "$src"
     git checkout -q --detach "$commit"
   fi
   patch -Np1 -i "$repo/pkg/krdc-ai.patch"
+  # Windows-only fixes for pre-existing upstream bugs (see the patch header);
+  # applied after krdc-ai.patch, and deliberately not part of the
+  # AUR/upstream patch series.
+  patch -Np1 -i "$repo/winbuild/windows-porting.patch"
 )
 
 # --- configure & build ------------------------------------------------------------

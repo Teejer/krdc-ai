@@ -1,0 +1,24 @@
+Windows portability fixes for upstream KRDC, applied by winbuild/ after
+krdc-ai.patch. Kept out of the AUR/upstream patch so the AI feature series
+stays reviewable on its own; these are pre-existing Windows-only bugs in
+upstream code that Linux CI never compiles.
+
+1. rdp/rdpsession.cpp: the _WIN32 WSAStartup block logs with SDL_TAG, a tag
+   string private to FreeRDP's SDL client (this block was copy-pasted from
+   there). It is not part of FreeRDP's public API; WLog only wants a tag
+   string.
+
+diff --git a/rdp/rdpsession.cpp b/rdp/rdpsession.cpp
+--- a/rdp/rdpsession.cpp
++++ b/rdp/rdpsession.cpp
+@@ -505,7 +505,9 @@
+     const DWORD wVersionRequested = MAKEWORD(1, 1);
+     const int rc = WSAStartup(wVersionRequested, &wsaData);
+     if (rc != 0) {
+-        WLog_ERR(SDL_TAG, "WSAStartup failed with %s [%d]", gai_strerrorA(rc), rc);
++        // SDL_TAG belongs to FreeRDP's SDL client, not to FreeRDP itself;
++        // WLog takes any tag string.
++        WLog_ERR("krdc.rdp", "WSAStartup failed with %s [%d]", gai_strerrorA(rc), rc);
+         return false;
+     }
+ #endif
