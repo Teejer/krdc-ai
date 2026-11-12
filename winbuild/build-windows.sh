@@ -58,7 +58,14 @@ for p in "${mingw_deps[@]}"; do
   pacman -Qq "mingw-w64-ucrt-x86_64-$p" >/dev/null 2>&1 || missing+=("mingw-w64-ucrt-x86_64-$p")
 done
 if ((${#missing[@]})); then
-  pacman -S --needed --noconfirm "${missing[@]}"
+  # MSYS2 mirrors occasionally stall mid-download and abort the whole
+  # pacman transaction; retry a few times before giving up.
+  for attempt in 1 2 3; do
+    pacman -S --needed --noconfirm --disable-download-timeout "${missing[@]}" && break
+    if ((attempt == 3)); then exit 1; fi
+    echo "pacman attempt $attempt failed; retrying in 10s" >&2
+    sleep 10
+  done
 fi
 
 # --- source ---------------------------------------------------------------------
