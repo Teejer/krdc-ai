@@ -43,10 +43,10 @@ pkgrel=$(sed -n 's/^pkgrel=//p' "$pkgbuild")
 # Single source of truth: CI preinstalls nothing beyond base + git, this
 # check installs whatever is missing (a no-op when everything is present).
 mingw_deps=(
-  gcc cmake ninja pkgconf extra-cmake-modules qt6-base qt6keychain-qt6
+  gcc cmake ninja pkgconf extra-cmake-modules qt6-base qtkeychain
   breeze-icons freerdp libvncserver
   kbookmarks kcmutils kcompletion kconfig kcrash kdnssd kguiaddons
-  ki18n kiconthemes kio knotifyconfig knotifications ksolid
+  ki18n kiconthemes kio knotifyconfig knotifications solid
   kstatusnotifieritem kwidgetsaddons kwindowsystem kxmlgui
 )
 msys_deps=(git patch tar zip gettext python)
