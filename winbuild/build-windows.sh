@@ -148,7 +148,12 @@ rm -rf "$dist"
 mkdir -p "$dbin"
 cp "$prefix/bin/krdc.exe" "$dbin/"
 for f in "$prefix"/bin/libkrdccore*.dll; do cp "$f" "$dbin/"; done
-cp -r "$prefix/plugins" "$dist/plugins"
+# Put the plugin tree under bin/krdc (Qt always searches a krdc/ subdir of
+# the executable's own directory via QCoreApplication::libraryPaths()). The
+# compiled-in KRDC_PLUGIN_INSTALL_DIR bakes $<TARGET_FILE_DIR> - an absolute
+# build-tree path - into the exe, so it can never resolve in a portable zip
+# (harmless on the AUR build, where plugins sit in Qt's own prefix path).
+cp -r "$prefix/plugins/krdc" "$dbin/krdc"
 
 # FreeRDP 3 loads its channel plugins dynamically at runtime; keep MSYS2's
 # lib/freerdp3 next to bin/ so winpr's module search (relative to the
@@ -195,8 +200,8 @@ copy_deps() {
 }
 copy_deps "$dbin/krdc.exe" \
   "$dbin"/*.dll \
-  "$dist"/plugins/krdc/*.dll \
-  "$dist"/plugins/krdc/kcms/*.dll \
+  "$dbin"/krdc/*.dll \
+  "$dbin"/krdc/kcms/*.dll \
   "$dist"/lib/freerdp3/*.dll
 
 cat >"$dist/README.txt" <<EOF
