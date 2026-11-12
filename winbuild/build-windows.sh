@@ -224,13 +224,12 @@ Run bin/krdc.exe. Nothing to install.
   from this folder (feel free to open the script in Notepad and read
   it first):
     Unblock-File .\import-mremoteng.ps1
-    powershell -ExecutionPolicy RemoteSigned -File .\import-mremoteng.ps1
-  Unblock-File only clears the "downloaded from the internet" mark on
-  this one file; RemoteSigned applies to this window, not the machine.
-  The script mirrors your mRemoteNG folders and RDP connections into a
-  "mRemoteNG import" bookmark folder; passwords are never moved (KRDC
-  asks once per host and stores them in the Windows credential store).
-  Re-running only adds what's new.
+    powershell -File .\import-mremoteng.ps1
+  Unblock-File just clears the "downloaded from the internet" mark on
+  this one file. The script mirrors your mRemoteNG folders and RDP
+  connections into a "mRemoteNG import" bookmark folder; passwords are
+  never moved (KRDC asks once per host and stores them in the Windows
+  credential store). Re-running only adds what's new.
 * VNC and SPICE are not in this build.
 EOF
 
