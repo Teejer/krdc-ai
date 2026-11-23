@@ -48,6 +48,9 @@ public:
         QString toolCallId; ///< Role::Tool: which call this answers
         QString toolName; ///< display only, for Role::Tool and Role::Assistant
         QByteArray image; ///< Role::User: JPEG bytes
+        QByteArray aimImage; ///< Role::Tool: PNG crosshair crop of where a
+                             ///< pointer action aimed. Display only: never
+                             ///< sent to the model, never saved to history.
         QList<AiToolCall> toolCalls; ///< Role::Assistant
         QString detail; ///< Role::Note: extra explanation
         /** When this happened, for the chat log. Defaults to "now"; load()
@@ -84,6 +87,19 @@ public:
      * pending call is not a point action or no screen is available.
      */
     QPixmap pendingPreview() const;
+
+    /** True for the tools that aim the pointer at coordinates. */
+    static bool isPointingTool(const QString &name);
+
+    /** True when the last turn stopped at the tool-round limit; the page
+     * shows a Continue button while it holds. */
+    bool roundCapReached() const
+    {
+        return m_roundCapReached;
+    }
+
+    /** Grants another batch of tool rounds after roundCapReached(). */
+    void continueAfterCap();
 
     void setConfig(const AiConfig &config);
     const AiConfig &config() const;
@@ -130,6 +146,7 @@ private Q_SLOTS:
     void onReply(const QString &content, const QList<AiToolCall> &toolCalls);
     void onFailed(const QString &message);
     void typeNextChunk();
+    void pasteNow();
 
 private:
     struct PendingTool {
@@ -138,6 +155,9 @@ private:
     };
 
     QJsonArray buildMessages() const;
+    /** Screenshot crop with crosshairs at the coordinates a pointer tool
+     * targets; empty when nothing can be shown. */
+    QPixmap aimCrop(const QString &name, const QJsonObject &arguments) const;
     void sendToModel();
     void processQueue();
     void runTool(const PendingTool &pending);
@@ -169,6 +189,11 @@ private:
     QList<PendingTool> m_queue;
     int m_queueIndex = 0;
     bool m_awaiting = false;
+    bool m_pasteActive = false; ///< clipboard paste keystroke pending
+    AiToolCall m_pasteCall;
+    int m_learnedTypeDelay = 0; ///< slowest delay_ms the model asked for this conversation
+    bool m_roundCapReached = false;
+    QPixmap m_aimCrop; ///< set by runTool before a pointer action lands
     bool m_denied = false;
     bool m_busy = false;
     int m_rounds = 0;

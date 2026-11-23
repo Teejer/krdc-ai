@@ -217,7 +217,31 @@ QJsonArray AiTools::schemas()
         properties.insert(QStringLiteral("x"), property(QStringLiteral("integer"), QStringLiteral("X coordinate in screenshot pixels.")));
         properties.insert(QStringLiteral("y"), property(QStringLiteral("integer"), QStringLiteral("Y coordinate in screenshot pixels.")));
         tools.append(wrapped(QStringLiteral("mouse_move"),
-                             QStringLiteral("Move the remote pointer without clicking, e.g. to reveal a tooltip or hover state."),
+                             QStringLiteral("Move the remote pointer without clicking, e.g. to reveal a tooltip or hover "
+                                            "state. Prefer the hover tool for menus: it also waits for the menu to open "
+                                            "and returns a screenshot."),
+                             properties,
+                             {QStringLiteral("x"), QStringLiteral("y")}));
+    }
+
+    {
+        // Cascading menus are a timing problem, not a coordinate problem:
+        // the submenu does not exist on screen until the pointer has rested
+        // on the parent item for the remote's hover delay (about 400ms on
+        // Windows). A model that clicks the parent and then clicks where the
+        // submenu "should be" hits empty desktop and closes the whole menu.
+        // So waiting and looking are built into the tool the model reaches
+        // for, and it cannot skip them.
+        QJsonObject properties;
+        properties.insert(QStringLiteral("x"), property(QStringLiteral("integer"), QStringLiteral("X coordinate in screenshot pixels.")));
+        properties.insert(QStringLiteral("y"), property(QStringLiteral("integer"), QStringLiteral("Y coordinate in screenshot pixels.")));
+        tools.append(wrapped(QStringLiteral("hover"),
+                             QStringLiteral("Move the remote pointer onto something without clicking, wait for any menu, "
+                                            "submenu or tooltip to open, and return a fresh screenshot. This is how menus "
+                                            "are driven: click the menu title, screenshot, hover the entry with the "
+                                            "submenu arrow, then click the submenu entry you can now see in the returned "
+                                            "screenshot. Never click a submenu entry you have not seen in a screenshot - "
+                                            "it has probably not opened yet and the click would close the menu."),
                              properties,
                              {QStringLiteral("x"), QStringLiteral("y")}));
     }
@@ -235,7 +259,11 @@ QJsonArray AiTools::schemas()
                           property(QStringLiteral("string"),
                                    QStringLiteral("What you are clicking, in a few words, e.g. \"the OK button\". Shown to the "
                                                   "user for approval.")));
-        tools.append(wrapped(QStringLiteral("mouse_click"), QStringLiteral("Click at a point on the remote screen."), properties,
+        tools.append(wrapped(QStringLiteral("mouse_click"),
+                             QStringLiteral("Click at a point on the remote screen. Only click something visible in the "
+                                            "latest screenshot; clicking where a submenu is expected but not yet visible "
+                                            "lands outside the menu and closes it - hover the parent entry first."),
+                             properties,
                              {QStringLiteral("x"), QStringLiteral("y")}));
     }
 
@@ -276,11 +304,19 @@ QJsonArray AiTools::schemas()
                                    QStringLiteral("The text to type at the current remote focus. Use \\n for Enter.")));
         properties.insert(QStringLiteral("delay_ms"),
                           property(QStringLiteral("integer"),
-                                   QStringLiteral("Milliseconds to pause between characters. Use 50 or more for terminals "
-                                                  "and search boxes that drop characters.")));
+                                   QStringLiteral("Milliseconds to pause between keystrokes when typing character by "
+                                                  "character. Use 50 or more on slow or nested remote sessions.")));
+        properties.insert(QStringLiteral("method"),
+                          property(QStringLiteral("string"),
+                                   QStringLiteral("auto (default): text longer than a few characters goes through the "
+                                                  "remote clipboard and is pasted, which survives nested remote sessions; "
+                                                  "keys: type every character as keystrokes (use for fields that reject "
+                                                  "pasting, like password boxes); paste: always use the clipboard.")));
         tools.append(wrapped(QStringLiteral("type_text"),
                              QStringLiteral("Type text into whatever has the keyboard focus on the remote machine. Click the "
-                                            "field first so focus is where you expect."),
+                                            "field first so focus is where you expect. If the text arrives garbled or with "
+                                            "missing characters, retry with method \"keys\" and delay_ms 60, or take a "
+                                            "screenshot to check before retrying."),
                              properties,
                              {QStringLiteral("text")}));
     }
@@ -350,9 +386,9 @@ bool AiTools::isKnownTool(const QString &name)
 {
     static const QStringList names = {
         QStringLiteral("take_screenshot"), QStringLiteral("screen_info"),      QStringLiteral("mouse_move"),
-        QStringLiteral("mouse_click"),     QStringLiteral("mouse_drag"),       QStringLiteral("mouse_scroll"),
-        QStringLiteral("type_text"),       QStringLiteral("press_key"),        QStringLiteral("hotkey"),
-        QStringLiteral("save_screenshot"), QStringLiteral("wait"),
+        QStringLiteral("hover"),           QStringLiteral("mouse_click"),      QStringLiteral("mouse_drag"),
+        QStringLiteral("mouse_scroll"),    QStringLiteral("type_text"),        QStringLiteral("press_key"),
+        QStringLiteral("hotkey"),          QStringLiteral("save_screenshot"), QStringLiteral("wait"),
     };
     return names.contains(name);
 }
@@ -402,6 +438,9 @@ QString AiTools::describe(const QString &name, const QJsonObject &arguments)
     }
     if (name == QLatin1String("mouse_move")) {
         return QStringLiteral("Move the remote pointer to (%1, %2)").arg(number(QStringLiteral("x")), number(QStringLiteral("y")));
+    }
+    if (name == QLatin1String("hover")) {
+        return QStringLiteral("Hover (%1, %2) and look").arg(number(QStringLiteral("x")), number(QStringLiteral("y")));
     }
     if (name == QLatin1String("mouse_click")) {
         const QString button = arguments.value(QStringLiteral("button")).toString();

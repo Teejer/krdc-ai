@@ -40,6 +40,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or b"{}"))
         messages = body.get("messages", [])
+        # Act like a strict OpenAI-compatible server: every tool result must
+        # answer a tool call in the assistant message before it.
+        for i, m in enumerate(messages):
+            if m.get("role") == "tool":
+                prev = next((x for x in reversed(messages[:i])
+                             if x.get("role") == "assistant"), None)
+                ids = [c.get("id") for c in (prev or {}).get("tool_calls", [])]
+                if m.get("tool_call_id") not in ids:
+                    raw = json.dumps({"error": {"message":
+                        "No tool call found for function call output with call_id %s"
+                        % m.get("tool_call_id")}}).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
         user_text = " ".join(
             m["content"] if isinstance(m.get("content"), str) else json.dumps(m.get("content"))
             for m in messages if m.get("role") == "user"

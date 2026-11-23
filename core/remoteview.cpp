@@ -500,6 +500,11 @@ bool RemoteView::aiTypeText(const QString &)
     return false;
 }
 
+bool RemoteView::aiSetClipboard(const QString &)
+{
+    return false;
+}
+
 void RemoteView::setKeyboardGrabSuspended(bool suspended)
 {
     if (m_keyboardGrabSuspended == suspended) {

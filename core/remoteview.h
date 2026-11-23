@@ -365,6 +365,14 @@ public:
     virtual bool aiTypeText(const QString &text);
 
     /**
+     * Places @p text on the remote machine's clipboard without touching the
+     * local one. The view can then paste it with one keystroke, which beats
+     * per-character injection over lossy or nested connections.
+     * @return false when the view has no clipboard channel.
+     */
+    virtual bool aiSetClipboard(const QString &text);
+
+    /**
      * Temporarily gives up an exclusive keyboard grab, e.g. while the user is
      * typing into a widget outside the remote view such as the AI chat panel.
      * Unlike the host key this does not change any of the user's settings:

@@ -63,5 +63,6 @@ private:
     QToolButton *m_screenshotButton;
     QPushButton *m_sendButton;
     QPushButton *m_stopButton;
+    QPushButton *m_continueButton;
     QLabel *m_statusLabel;
 };

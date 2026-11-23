@@ -24,6 +24,7 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QRegularExpression>
+#include <QSet>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -34,9 +35,24 @@ namespace
 // Safety limits so a confused model cannot spin forever or stall the UI.
 constexpr int MaxToolRounds = 25;
 constexpr int MaxHistoryEntries = 200;
-constexpr int TypeChunkSize = 64;
 constexpr int MaxTypeDelayMs = 200;
+// Gap between announcing the clipboard contents and sending Ctrl+V, so the
+// clipboard channel's announcement reaches the server before the paste.
+constexpr int PasteDelayMs = 120;
+// The Windows input queue inside an RDP session drops synthetic key events
+// that arrive in bursts; nothing human types 64 characters in one synchronous
+// loop. Lost keystrokes and lost Shift transitions showed up as missing
+// characters, lowercase capitals, stray caps and PSReadLine-redrawn lines.
+// Type one character per tick with a floor on the gap instead.
+constexpr int MinTypeCharDelayMs = 15;
 constexpr double MaxWaitSeconds = 30.0;
+// Remote menus open submenus on a hover timer (Windows: SM_MENU_SHOWDELAY,
+// ~400ms), and the opened submenu only reaches our screenshot after the RDP
+// damage update arrives. A click aimed at a submenu that has not rendered
+// lands on whatever is behind it and closes the whole menu, so the hover
+// tool rests the pointer past the delay plus a little margin before it
+// looks.
+constexpr int HoverSettleMs = 800;
 
 // How many trailing entries survive into the saved history.
 constexpr int SavedHistoryEntries = 120;
@@ -140,6 +156,13 @@ AiConversation::AiConversation(const QString &key, QObject *parent)
     m_client.setConfig(m_config);
     connect(&m_client, &AiHttpClient::replyReceived, this, &AiConversation::onReply);
     connect(&m_client, &AiHttpClient::requestFailed, this, &AiConversation::onFailed);
+    connect(&m_client, &AiHttpClient::infoNote, this, [this](const QString &message) {
+        Entry note;
+        note.role = Role::Note;
+        note.text = message;
+        m_entries.append(note);
+        Q_EMIT entriesChanged();
+    });
 
     if (m_config.rememberHistory) {
         load();
@@ -214,6 +237,17 @@ QPixmap AiConversation::pendingPreview() const
     if (name != QLatin1String("mouse_click") && name != QLatin1String("mouse_drag") && name != QLatin1String("mouse_scroll")) {
         return {};
     }
+    return aimCrop(name, pending.call.arguments);
+}
+
+bool AiConversation::isPointingTool(const QString &name)
+{
+    return name == QLatin1String("mouse_click") || name == QLatin1String("mouse_drag")
+        || name == QLatin1String("mouse_scroll");
+}
+
+QPixmap AiConversation::aimCrop(const QString &name, const QJsonObject &args) const
+{
     if (!m_view || m_view->status() != RemoteView::Connected) {
         return {};
     }
@@ -226,7 +260,6 @@ QPixmap AiConversation::pendingPreview() const
         return {};
     }
 
-    const QJsonObject args = pending.call.arguments;
     QList<QPoint> points;
     const QSize aim = aimSize();
     auto read = [&args, &aim](const QString &xName, const QString &yName) -> QPoint {
@@ -331,6 +364,27 @@ void AiConversation::ask(const QString &question, bool attachScreenshot)
     m_entries.append(entry);
 
     m_rounds = 0;
+    m_roundCapReached = false;
+    m_client.resetTokenBudget();
+    setBusy(true);
+    Q_EMIT entriesChanged();
+    sendToModel();
+}
+
+void AiConversation::continueAfterCap()
+{
+    if (!m_roundCapReached || busy() || m_awaiting) {
+        return;
+    }
+    m_roundCapReached = false;
+    m_rounds = 0; // a fresh batch of rounds
+    m_client.resetTokenBudget();
+
+    Entry entry;
+    entry.role = Role::User;
+    entry.text = tr("Continue");
+    m_entries.append(entry);
+
     setBusy(true);
     Q_EMIT entriesChanged();
     sendToModel();
@@ -350,7 +404,7 @@ void AiConversation::approve()
 
     // Same continuation rule as processQueue(): if the tool handed work to an
     // async step, its slot advances the queue when it reports back.
-    if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive) {
+    if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive || m_pasteActive) {
         return;
     }
     m_queueIndex++;
@@ -475,6 +529,11 @@ void AiConversation::sendToModel()
 QJsonArray AiConversation::buildMessages() const
 {
     QJsonArray messages;
+    // Tool results are only legal right after the assistant message that
+    // requested them; a result whose call is gone (history saved by an older
+    // version, or a history window cut between the pair) makes strict
+    // OpenAI-compatible servers answer HTTP 400.
+    QSet<QString> openToolCallIds;
 
     QString system = m_config.systemPrompt.trimmed();
     if (system.isEmpty()) {
@@ -529,13 +588,20 @@ QJsonArray AiConversation::buildMessages() const
                     function.insert(QStringLiteral("arguments"), QString::fromUtf8(QJsonDocument(call.arguments).toJson(QJsonDocument::Compact)));
                     object.insert(QStringLiteral("function"), function);
                     calls.append(object);
+                    openToolCallIds.insert(call.id);
                 }
                 message.insert(QStringLiteral("tool_calls"), calls);
+            } else {
+                openToolCallIds.clear();
             }
             messages.append(message);
             break;
         }
         case Role::Tool: {
+            if (!openToolCallIds.remove(entry.toolCallId)) {
+                qCWarning(KRDC) << "Dropping orphaned tool result from history for call id" << entry.toolCallId;
+                break;
+            }
             QJsonObject message;
             message.insert(QStringLiteral("role"), QStringLiteral("tool"));
             message.insert(QStringLiteral("tool_call_id"), entry.toolCallId);
@@ -591,9 +657,16 @@ void AiConversation::onReply(const QString &content, const QList<AiToolCall> &to
     }
 
     if (++m_rounds > MaxToolRounds) {
+        // Keep the history valid for the next request: the calls this reply
+        // announced were never run, so they must not sit in the transcript
+        // without answers. The Continue button has the model pick it up again.
+        if (!m_entries.isEmpty() && m_entries.last().role == Role::Assistant) {
+            m_entries.last().toolCalls.clear();
+        }
+        m_roundCapReached = true;
         Entry note;
         note.role = Role::Note;
-        note.text = i18n("Too many tool calls in a row; stopping to avoid a loop. Ask me again if you want me to continue.");
+        note.text = i18n("Too many tool calls in a row; stopping to avoid a loop. Press Continue to give me %1 more rounds.").arg(MaxToolRounds);
         m_entries.append(note);
         setBusy(false);
         Q_EMIT entriesChanged();
@@ -658,7 +731,7 @@ void AiConversation::processQueue()
         // paced typing or a wait timer. In those cases the continuation
         // happens in a slot; stop here so we do not run later calls out of
         // order.
-        if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive) {
+        if (m_client.busy() || !m_typeRemainder.isEmpty() || m_waitActive || m_pasteActive) {
             return;
         }
         m_queueIndex++;
@@ -697,6 +770,14 @@ void AiConversation::finishTool(const AiToolCall &call, const QString &result, c
     entry.toolCallId = call.id;
     entry.toolName = call.name;
     entry.image = image;
+    if (isPointingTool(call.name) && !m_aimCrop.isNull()) {
+        QByteArray png;
+        QBuffer buffer{&png};
+        buffer.open(QIODevice::WriteOnly);
+        m_aimCrop.save(&buffer, "PNG");
+        entry.aimImage = png;
+        m_aimCrop = QPixmap{};
+    }
     m_entries.append(entry);
     Q_EMIT entriesChanged();
 }
@@ -718,6 +799,14 @@ void AiConversation::setBusy(bool busy)
 void AiConversation::runTool(const PendingTool &pending)
 {
     const AiToolCall &call = pending.call;
+
+    // Grab the crosshair crop before the action lands, so the chat can show
+    // where the pointer was aimed even when the click needed no approval.
+    if (isPointingTool(call.name)) {
+        m_aimCrop = aimCrop(call.name, call.arguments);
+    } else {
+        m_aimCrop = QPixmap{};
+    }
     const QString name = call.name;
     const QJsonObject &args = call.arguments;
 
@@ -826,6 +915,48 @@ void AiConversation::runTool(const PendingTool &pending)
         return;
     }
 
+    if (name == QLatin1String("hover")) {
+        QPoint raw;
+        QString error;
+        if (!pointArg(args, QStringLiteral("x"), QStringLiteral("y"), &raw, &error, aimSize())) {
+            failTool(call, error);
+            return;
+        }
+        const QPoint pos = toScreen(raw);
+        // Move, then rest the pointer through the remote's hover delay in a
+        // timer rather than blocking, and come back holding a fresh screen-
+        // shot. The model cannot get ahead of the submenu: the screenshot it
+        // is handed is taken after the submenu had time to open and arrive
+        // over the wire, so the entry it clicks next is one it can already
+        // see. This reuses the wait machinery, so a cancel during the settle
+        // drops it exactly like a cancelled wait.
+        view->aiMouseMove(pos);
+        m_waitCall = call;
+        m_waitActive = true;
+        QTimer::singleShot(HoverSettleMs, this, [this, pos] {
+            m_waitActive = false;
+            if (!m_busy) {
+                return; // the turn was cancelled while we waited
+            }
+            const QByteArray image = grabScreenshot();
+            if (image.isEmpty()) {
+                finishTool(m_waitCall, QStringLiteral("Hovered (%1, %2), but no screenshot was available.").arg(pos.x()).arg(pos.y()));
+            } else {
+                finishTool(m_waitCall,
+                           QStringLiteral("Hovered (%1, %2). Any submenu or tooltip it opens is in the attached "
+                                          "screenshot (%3x%4 pixels); click an entry you can see in it.")
+                               .arg(pos.x())
+                               .arg(pos.y())
+                               .arg(m_sentImageSize.width())
+                               .arg(m_sentImageSize.height()),
+                           image);
+            }
+            m_queueIndex++;
+            processQueue();
+        });
+        return;
+    }
+
     if (name == QLatin1String("mouse_click")) {
         bool buttonOk = true;
         const Qt::MouseButton button = buttonFromName(args.value(QStringLiteral("button")).toString(), &buttonOk);
@@ -922,17 +1053,45 @@ void AiConversation::runTool(const PendingTool &pending)
             return;
         }
 
-        const int delay = clampInt(args.value(QStringLiteral("delay_ms")).toDouble(0), 0, MaxTypeDelayMs, 0);
-        if (delay == 0) {
-            if (view->aiTypeText(text)) {
-                finishTool(call, QStringLiteral("Typed %1 characters.").arg(text.length()));
-            } else {
-                finishTool(call, QStringLiteral("Typed %1 characters, but some characters could not be injected.").arg(text.length()));
-            }
+        QString method = args.value(QStringLiteral("method")).toString().trimmed().toLower();
+        if (method.isEmpty()) {
+            method = QStringLiteral("auto");
+        }
+        if (method != QLatin1String("keys") && method != QLatin1String("paste") && method != QLatin1String("auto")) {
+            failTool(call, QStringLiteral("Unknown typing method “%1”. Use auto, keys or paste.").arg(method));
             return;
         }
 
-        // Paced typing: send in chunks on a timer so the remote field keeps up.
+        // Clipboard paste carries the whole text as one payload and one
+        // Ctrl+V, so intermediate input queues - a remote session nested
+        // inside another remote session especially - have no per-character
+        // events to lose. Short strings still type as keys so the remote
+        // clipboard is not overwritten unnecessarily.
+        const bool preferPaste = method == QLatin1String("paste")
+            || (method == QLatin1String("auto") && text.length() > 8);
+        if (preferPaste && view->aiSetClipboard(text)) {
+            m_pasteCall = call;
+            m_pasteActive = true;
+            // Give the clipboard announcement a beat to reach the server
+            // before the paste keystroke.
+            QTimer::singleShot(PasteDelayMs, this, &AiConversation::pasteNow);
+            return;
+        }
+        if (method == QLatin1String("paste")) {
+            failTool(call, QStringLiteral("This connection has no clipboard channel; type with method \"keys\" instead."));
+            return;
+        }
+
+        const int delay = clampInt(args.value(QStringLiteral("delay_ms")).toDouble(0), 0, MaxTypeDelayMs, 0);
+        if (delay > 0) {
+            // The model passed a delay because it saw text arrive badly:
+            // remember the slowest pacing it has asked for and keep it for
+            // the rest of this conversation.
+            m_learnedTypeDelay = qMax(m_learnedTypeDelay, delay);
+        }
+
+        // Keys are always paced: remote input queues drop synthetic events
+        // arriving in bursts, and nested sessions drop even more.
         m_typeCall = call;
         m_typeDelay = delay;
         m_typeRemainder = text;
@@ -1001,6 +1160,24 @@ void AiConversation::runTool(const PendingTool &pending)
     failTool(call, QStringLiteral("Unknown tool “%1”.").arg(name));
 }
 
+void AiConversation::pasteNow()
+{
+    m_pasteActive = false;
+    RemoteView *view = m_view;
+    if (!view || !m_busy) {
+        return;
+    }
+
+    QString error;
+    if (sendChord(view, {QStringLiteral("ctrl"), QStringLiteral("v")}, &error)) {
+        finishTool(m_pasteCall, QStringLiteral("Pasted the text through the remote clipboard."));
+    } else {
+        failTool(m_pasteCall, error);
+    }
+    m_queueIndex++;
+    processQueue();
+}
+
 void AiConversation::typeNextChunk()
 {
     RemoteView *view = m_view;
@@ -1009,7 +1186,7 @@ void AiConversation::typeNextChunk()
         return;
     }
 
-    const QString chunk = m_typeRemainder.left(TypeChunkSize);
+    const QString chunk = m_typeRemainder.left(1);
     m_typeRemainder.remove(0, chunk.length());
 
     const bool ok = view->aiTypeText(chunk);
@@ -1022,11 +1199,13 @@ void AiConversation::typeNextChunk()
     }
 
     if (m_typeRemainder.isEmpty()) {
-        finishTool(m_typeCall, QStringLiteral("Typed text."));
+        finishTool(m_typeCall, QStringLiteral("Typed text (paced at %1 ms per character).")
+                                   .arg(qMax(qMax(m_typeDelay, MinTypeCharDelayMs), m_learnedTypeDelay)));
         m_queueIndex++;
         processQueue();
     } else {
-        QTimer::singleShot(m_typeDelay, this, &AiConversation::typeNextChunk);
+        QTimer::singleShot(qMax(qMax(m_typeDelay, MinTypeCharDelayMs), m_learnedTypeDelay),
+                           this, &AiConversation::typeNextChunk);
     }
 }
 
@@ -1132,6 +1311,15 @@ void AiConversation::load()
         }
         entry.toolCallId = object.value(QStringLiteral("tool_call_id")).toString();
         entry.toolName = object.value(QStringLiteral("tool")).toString();
+        const QJsonArray calls = object.value(QStringLiteral("tool_calls")).toArray();
+        for (const QJsonValue &callValue : calls) {
+            const QJsonObject callObject = callValue.toObject();
+            AiToolCall call;
+            call.id = callObject.value(QStringLiteral("id")).toString();
+            call.name = callObject.value(QStringLiteral("name")).toString();
+            call.arguments = QJsonDocument::fromJson(callObject.value(QStringLiteral("arguments")).toString().toUtf8()).object();
+            entry.toolCalls.append(call);
+        }
         const QString image = object.value(QStringLiteral("image")).toString();
         if (!image.isEmpty()) {
             entry.image = QByteArray::fromBase64(image.toLatin1());
@@ -1175,6 +1363,19 @@ void AiConversation::save() const
         }
         if (!entry.toolName.isEmpty()) {
             object.insert(QStringLiteral("tool"), entry.toolName);
+        }
+        // The assistant's tool calls must survive the round trip: a saved
+        // tool result without its matching call poisons every later request.
+        if (entry.role == Role::Assistant && !entry.toolCalls.isEmpty()) {
+            QJsonArray calls;
+            for (const AiToolCall &call : entry.toolCalls) {
+                QJsonObject callObject;
+                callObject.insert(QStringLiteral("id"), call.id);
+                callObject.insert(QStringLiteral("name"), call.name);
+                callObject.insert(QStringLiteral("arguments"), QString::fromUtf8(QJsonDocument(call.arguments).toJson(QJsonDocument::Compact)));
+                calls.append(callObject);
+            }
+            object.insert(QStringLiteral("tool_calls"), calls);
         }
         // Screenshots are not persisted: they are large, go stale instantly,
         // and the model can always take a fresh one.

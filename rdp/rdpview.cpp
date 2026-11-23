@@ -21,6 +21,7 @@
 #include <QApplication>
 #include <QChar>
 #include <QDir>
+#include <QMimeData>
 #include <QEvent>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -693,6 +694,18 @@ bool RdpView::aiTypeText(const QString &text)
         return false;
     }
     return m_session->aiTypeText(text) == 0;
+}
+
+bool RdpView::aiSetClipboard(const QString &text)
+{
+    if (!m_session) {
+        return false;
+    }
+    QMimeData *mimeData = new QMimeData;
+    mimeData->setText(text);
+    const bool sent = m_session->sendClipboard(mimeData);
+    delete mimeData;
+    return sent;
 }
 
 bool RdpView::supportsScaling() const

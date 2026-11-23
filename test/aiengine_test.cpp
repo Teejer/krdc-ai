@@ -14,7 +14,11 @@
 #include <KLocalizedString>
 
 #include <QApplication>
+#include <QCryptographicHash>
 #include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QStandardPaths>
 #include <QTimer>
 #include <QTextStream>
 
@@ -218,6 +222,8 @@ static void testRiskClassification()
 
     check(AiTools::risk(QStringLiteral("mouse_click"), arg(QStringLiteral("x"), QStringLiteral("10"))) == AiTools::Risk::Action,
           "mouse_click is an action");
+    check(AiTools::risk(QStringLiteral("hover"), arg(QStringLiteral("x"), QStringLiteral("10"))) == AiTools::Risk::Action,
+          "hover moves the remote pointer, so it is an action like mouse_move");
 
     QJsonObject clickArgs;
     clickArgs.insert(QStringLiteral("x"), 40);
@@ -387,6 +393,100 @@ static void testHistoryRoundTrip(AiConfig config)
     check(other.entries().isEmpty(), "a different connection key starts with an empty chat");
 }
 
+static void testToolHistoryRoundTrip(AiConfig config)
+{
+    out << "\n== tool calls round-trip through saved history ==" << Qt::endl;
+
+    config.rememberHistory = true;
+    config.autoExecute = true;
+
+    const QString key = QStringLiteral("tool-history-host");
+    {
+        AiConversation conversation{key};
+        conversation.setConfig(config);
+        conversation.ask(QStringLiteral("click there"), false);
+        waitUntil([&] { return !conversation.busy(); }, 12000);
+    }
+
+    AiConversation reopened{key};
+    reopened.setConfig(config);
+    waitUntil([&] { return !reopened.entries().isEmpty(); }, 2000);
+
+    bool assistantCarriesCall = false;
+    bool resultAnswersIt = false;
+    for (const auto &entry : reopened.entries()) {
+        for (const auto &call : entry.toolCalls) {
+            if (!call.id.isEmpty()) {
+                assistantCarriesCall = true;
+            }
+        }
+        if (entry.role == AiConversation::Role::Tool && !entry.toolCallId.isEmpty()) {
+            resultAnswersIt = true;
+        }
+    }
+    check(assistantCarriesCall, "the saved history keeps the assistant's tool calls");
+    check(resultAnswersIt, "the saved history keeps the matching tool result");
+
+    // Asking again must still work: the mock server answers HTTP 400 when a
+    // tool result arrives without its assistant tool call, exactly like the
+    // strict OpenAI-compatible servers do.
+    reopened.ask(QStringLiteral("and now?"), false);
+    waitUntil([&] { return !reopened.busy(); }, 12000);
+    bool answered = false;
+    for (const auto &entry : reopened.entries()) {
+        if (entry.role == AiConversation::Role::Assistant
+            && entry.text.contains(QStringLiteral("Tool results came back"))) {
+            answered = true;
+        }
+    }
+    check(answered, "a follow-up request with the reloaded tool pair is accepted");
+}
+
+static void testOrphanedToolResultsDropped(AiConfig config)
+{
+    out << "\n== orphaned tool results from old histories are dropped ==" << Qt::endl;
+
+    config.rememberHistory = true;
+    config.autoExecute = true;
+
+    const QString key = QStringLiteral("legacy-history-host");
+
+    // Write a history file in the old format: the tool result is saved but
+    // the assistant message that requested it has no tool_calls, because the
+    // version that saved it did not persist them.
+    const QString directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/ai");
+    QDir().mkpath(directory);
+    const QString digest = QString::fromLatin1(QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha1).toHex());
+    QFile file(directory + QLatin1Char('/') + digest + QStringLiteral(".json"));
+    if (!file.open(QIODevice::WriteOnly)) {
+        check(false, "the legacy history file can be written");
+        return;
+    }
+    file.write(R"({"key":"legacy-history-host","entries":[
+        {"role":"user","text":"click there"},
+        {"role":"assistant","text":""},
+        {"role":"tool","tool_call_id":"call_9","tool":"mouse_click","text":"Clicked."}
+    ]})");
+    file.close();
+
+    AiConversation conversation{key};
+    conversation.setConfig(config);
+    waitUntil([&] { return !conversation.entries().isEmpty(); }, 2000);
+
+    // buildMessages() must drop the orphaned result; otherwise the strict
+    // mock server 400s the request and no answer ever arrives.
+    conversation.ask(QStringLiteral("and now?"), false);
+    waitUntil([&] { return !conversation.busy(); }, 12000);
+    bool answered = false;
+    for (const auto &entry : conversation.entries()) {
+        if (entry.role == AiConversation::Role::Assistant
+            && entry.text.contains(QStringLiteral("Tool results came back"))) {
+            answered = true;
+        }
+    }
+    check(answered, "the request carrying an old orphaned tool result still went through");
+}
+
 static void testUnknownToolIsReported(AiConfig config)
 {
     out << "\n== unknown tools are reported, not crashed on ==" << Qt::endl;
@@ -401,7 +501,8 @@ static void testUnknownToolIsReported(AiConfig config)
     // through the tool schema table instead.
     check(!AiTools::isKnownTool(QStringLiteral("launch_nukes")), "an invented tool is not known");
     check(AiTools::isKnownTool(QStringLiteral("save_screenshot")), "the screenshot save tool is known");
-    check(AiTools::schemas().size() >= 8, "the schema list offers the expected number of tools");
+    check(AiTools::isKnownTool(QStringLiteral("hover")), "the hover tool that drives cascading menus is known");
+    check(AiTools::schemas().size() >= 12, "the schema list offers the expected number of tools");
     check(!AiTools::isKnownTool(QString()), "the empty name is not a tool");
 }
 
@@ -426,6 +527,8 @@ int main(int argc, char **argv)
     testDangerousAlwaysAsks(config);
     testSafeToolRunsImmediately(config);
     testHistoryRoundTrip(config);
+    testToolHistoryRoundTrip(config);
+    testOrphanedToolResultsDropped(config);
     testUnknownToolIsReported(config);
 
     out << "\n" << (failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED") << Qt::endl;

@@ -129,8 +129,13 @@ AiConversationPage::AiConversationPage(AiConversation *conversation, QWidget *pa
     m_sendButton = new QPushButton(i18n("Send"), this);
     m_stopButton = new QPushButton(i18n("Stop"), this);
     m_stopButton->setVisible(false);
+    m_continueButton = new QPushButton(i18n("Continue"), this);
+    m_continueButton->setToolTip(i18n("The assistant stopped after too many tool calls in a row. "
+                                      "This grants another batch of rounds and lets it carry on."));
+    m_continueButton->setVisible(false);
     inputButtons->addWidget(m_sendButton);
     inputButtons->addWidget(m_stopButton);
+    inputButtons->addWidget(m_continueButton);
     inputRow->addLayout(inputButtons);
     layout->addLayout(inputRow);
 
@@ -162,6 +167,7 @@ AiConversationPage::AiConversationPage(AiConversation *conversation, QWidget *pa
         m_conversation->deny();
     });
     connect(m_sendButton, &QPushButton::clicked, this, &AiConversationPage::send);
+    connect(m_continueButton, &QPushButton::clicked, this, [this] { m_conversation->continueAfterCap(); });
     connect(inputEdit, &SubmitOnEnterEdit::submit, this, &AiConversationPage::send);
     connect(m_stopButton, &QPushButton::clicked, this, [this] {
         m_conversation->cancel();
@@ -241,6 +247,7 @@ void AiConversationPage::reloadApprovalBar()
     }
 
     m_approvalBar->setVisible(awaiting);
+    m_continueButton->setVisible(m_conversation && m_conversation->roundCapReached() && !m_conversation->busy());
     m_input->setEnabled(m_conversation && !m_conversation->busy() && !awaiting);
 }
 
@@ -382,6 +389,14 @@ QString AiConversationPage::renderLog() const
         case AiConversation::Role::Tool: {
             html += QStringLiteral("<div style='%1'><small>%2</small></div>")
                         .arg(bubbleStyle(ToolBubble), escape(entry.text.left(400)));
+            if (!entry.aimImage.isEmpty()) {
+                // Where a pointer action was aimed, taken just before it
+                // landed. Embedded inline; shown only in the chat, never
+                // sent back to the model.
+                html += QStringLiteral("<div style='padding:2px 10px;'>"
+                                       "<img src='data:image/png;base64,%1' width='150'/></div>")
+                            .arg(QString::fromLatin1(entry.aimImage.toBase64()));
+            }
             break;
         }
         case AiConversation::Role::Note: {

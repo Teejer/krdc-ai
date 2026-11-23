@@ -50,12 +50,14 @@ void AiHttpClient::request(const QJsonArray &messages, const QJsonArray &tools)
     payload.insert(QStringLiteral("model"), m_config.model);
     payload.insert(QStringLiteral("messages"), messages);
     payload.insert(QStringLiteral("temperature"), m_config.temperature);
-    payload.insert(QStringLiteral("max_tokens"), m_config.maxTokens);
+    payload.insert(QStringLiteral("max_tokens"), qMax(m_config.maxTokens, m_effectiveMaxTokens));
     payload.insert(QStringLiteral("stream"), false);
     if (!tools.isEmpty()) {
         payload.insert(QStringLiteral("tools"), tools);
         payload.insert(QStringLiteral("tool_choice"), QStringLiteral("auto"));
     }
+    m_lastMessages = messages;
+    m_lastTools = tools;
 
     QNetworkRequest request{QUrl{m_config.chatUrl()}};
     request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
@@ -138,6 +140,78 @@ void AiHttpClient::onModelsFinished()
 
     qCDebug(KRDC) << "discovered" << ids.count() << "models";
     Q_EMIT modelsReceived(ids);
+}
+
+void AiHttpClient::resetTokenBudget()
+{
+    m_effectiveMaxTokens = 0;
+}
+
+void AiHttpClient::handleLengthCutoff()
+{
+    if (!m_ctxProbed) {
+        // Learn what the server can hold before growing the answer room past
+        // its context. Do it once per endpoint; failures just keep the
+        // conservative ceiling.
+        m_ctxProbed = true;
+        QNetworkRequest request{QUrl{m_config.modelsUrl()}};
+        if (!m_config.apiKey.isEmpty()) {
+            request.setRawHeader("Authorization", QStringLiteral("Bearer %1").arg(m_config.apiKey).toUtf8());
+        }
+        request.setTransferTimeout(std::chrono::seconds(10));
+        m_ctxReply = m_network->get(request);
+        connect(m_ctxReply, &QNetworkReply::finished, this, &AiHttpClient::onContextFinished);
+        return;
+    }
+    // Ceiling: the server's advertised context when known (never above the
+    // settings dialog's hard maximum), else that maximum.
+    const int ceiling = m_contextCeiling > 0 ? qMin(m_contextCeiling, 32768) : 32768;
+    const int current = qMax(m_config.maxTokens, m_effectiveMaxTokens);
+    if (current >= ceiling) {
+        Q_EMIT requestFailed(QStringLiteral("The answer was cut off at %1 tokens, the most this endpoint will take. "
+                                            "Try a shorter question or fewer screenshots.")
+                                 .arg(ceiling));
+        return;
+    }
+    m_effectiveMaxTokens = qMin(current * 2, ceiling);
+    Q_EMIT infoNote(QStringLiteral("The answer hit the token limit; retrying with room for %1 tokens.").arg(m_effectiveMaxTokens));
+    request(m_lastMessages, m_lastTools);
+}
+
+void AiHttpClient::onContextFinished()
+{
+    if (!m_ctxReply) {
+        return;
+    }
+
+    QNetworkReply *reply = m_ctxReply.data();
+    m_ctxReply.clear();
+    reply->deleteLater();
+
+    if (reply->error() == QNetworkReply::NoError) {
+        const QJsonDocument document = QJsonDocument::fromJson(reply->readAll());
+        const QJsonArray data = document.object().value(QStringLiteral("data")).toArray();
+        for (const QJsonValue &value : data) {
+            const QJsonObject model = value.toObject();
+            if (model.value(QStringLiteral("id")).toString() != m_config.model) {
+                continue;
+            }
+            // Every server names its context window differently.
+            for (const QString &key : {QStringLiteral("context_length"), QStringLiteral("context_window"),
+                                       QStringLiteral("max_context_length"), QStringLiteral("max_model_len"),
+                                       QStringLiteral("n_ctx"), QStringLiteral("max_position_embeddings")}) {
+                const int found = model.value(key).toInt(0);
+                if (found > 0) {
+                    m_contextCeiling = found;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    qCDebug(KRDC) << "server context ceiling:" << m_contextCeiling;
+    handleLengthCutoff();
 }
 
 static QString contentToText(const QJsonValue &content)
@@ -275,11 +349,10 @@ void AiHttpClient::onFinished()
     if (content.isEmpty() && toolCalls.isEmpty()) {
         const QString finish = choice.value(QStringLiteral("finish_reason")).toString();
         if (finish == QLatin1String("length")) {
-            Q_EMIT requestFailed(QStringLiteral("The answer was cut off at the token limit. Increase the answer length in the "
-                                                "assistant settings."));
-        } else {
-            Q_EMIT requestFailed(QStringLiteral("The model answered with an empty message."));
+            handleLengthCutoff();
+            return;
         }
+        Q_EMIT requestFailed(QStringLiteral("The model answered with an empty message."));
         return;
     }
 

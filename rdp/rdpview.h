@@ -66,6 +66,7 @@ public:
     void aiMouseWheel(const QPoint &pos, const QPoint &angleDelta) override;
     void aiKeyPress(int key, Qt::KeyboardModifiers modifiers, bool pressed) override;
     bool aiTypeText(const QString &text) override;
+    bool aiSetClipboard(const QString &text) override;
 
 public Q_SLOTS:
     void scaleResize(int w, int h) override;
